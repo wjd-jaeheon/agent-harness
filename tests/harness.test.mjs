@@ -152,6 +152,17 @@ test('list from a managed writer worktree selects only its owner run', async (t)
   assert.deepEqual(listed.runs.map((item) => item.runId), [owner.runId]);
 });
 
+test('list from an aborted writer worktree still selects its owner run', async (t) => {
+  const f = await fixture(t);
+  const owner = await initRun(f);
+  await runCommand(['abort', '--run', owner.runId, '--reason', 'stopped'], { harnessRoot: f.harnessRoot });
+  const run = await readRun(f.harnessRoot, owner.runId);
+  const listed = await runCommand(['list', '--repo', run.worktree_path], { harnessRoot: f.harnessRoot });
+  assert.equal(listed.ownerRunId, owner.runId);
+  assert.equal(listed.selectedRunId, owner.runId);
+  assert.deepEqual(listed.runs.map((item) => item.runId), [owner.runId]);
+});
+
 test('start owns init then plan execution through the next human gate', async (t) => {
   const f = await fixture(t);
   const scripted = scriptedProvider([

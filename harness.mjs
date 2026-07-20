@@ -701,12 +701,12 @@ async function listRunsCommand(values, options) {
       if (error.code === 'ENOENT') continue;
       throw error;
     }
-    if (CLOSED_RUN_STATES.has(run.state)) continue;
     if (pathKey(run.worktree_path) === pathKey(repo)) {
       ownerRunId = run.run_id;
       runs.push({ ...summarize(run), repoPath: run.repo_path, worktreePath: run.worktree_path });
       continue;
     }
+    if (CLOSED_RUN_STATES.has(run.state)) continue;
     if (!(await exists(run.repo_path))) {
       warnings.push({ runId: run.run_id, message: `stale repo path: ${run.repo_path}` });
       continue;
