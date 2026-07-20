@@ -1,0 +1,6 @@
+{
+  "budgets": {
+    "plan_review_max": 2,
+    "human_plan_revision_max": 1
+  }
+}

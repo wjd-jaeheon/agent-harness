@@ -1,0 +1,52 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "phase": { "const": "plan" },
+    "round": { "type": "integer", "minimum": 1 },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "severity": { "enum": ["blocker", "major", "minor"] },
+          "claim": { "type": "string" },
+          "failure_scenario": { "type": "string" },
+          "evidence": { "type": "array", "items": { "type": "string" } },
+          "needs_evidence": { "type": "boolean" }
+        },
+        "required": ["id", "severity", "claim", "failure_scenario", "evidence", "needs_evidence"]
+      }
+    },
+    "prior_findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "status": { "enum": ["resolved", "open"] }
+        },
+        "required": ["id", "status"]
+      }
+    },
+    "ac_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^AC-[0-9]{3}$" },
+          "status": { "enum": ["pass", "fail", "needs_evidence"] },
+          "implementation_ref": { "type": "string" },
+          "verification_ref": { "type": "string" }
+        },
+        "required": ["id", "status", "implementation_ref", "verification_ref"]
+      }
+    },
+    "checkpoint_count": { "type": "integer", "minimum": 0 }
+  },
+  "required": ["phase", "round", "findings", "prior_findings", "ac_checks", "checkpoint_count"]
+}
