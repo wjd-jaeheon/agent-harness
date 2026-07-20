@@ -216,8 +216,8 @@ test('launcher prints candidate and selected run context plus approval digest', 
   assert.ok(output.includes(`Plan SHA: ${'a'.repeat(64)}`));
 });
 
-test('launcher reserves Exit for closed runs', async () => {
-  for (const state of ['ABORTED', 'DONE', 'NEEDS_HUMAN']) {
+test('launcher keeps Abort and Exit for non-closed fallback states', async () => {
+  for (const state of ['ABORTED', 'DONE', 'NEEDS_HUMAN', 'IMPLEMENT_LOOP']) {
     const calls = [];
     const output = [];
     const answers = ['1', 'stop'];
@@ -241,9 +241,10 @@ test('launcher reserves Exit for closed runs', async () => {
       write: (line) => output.push(line),
     });
     const closed = state === 'ABORTED' || state === 'DONE';
-    assert.equal(output.includes('1. Exit'), closed);
-    assert.equal(output.includes('1. Abort'), !closed);
-    assert.equal(output.some((line) => line.startsWith('2. ')), false);
+    assert.deepEqual(
+      output.filter((line) => /^\d+\. /.test(line)),
+      closed ? ['1. Exit'] : ['1. Abort', '2. Exit'],
+    );
     assert.deepEqual(
       calls.map((argv) => argv[0]),
       closed ? ['list', 'status'] : ['list', 'status', 'abort'],

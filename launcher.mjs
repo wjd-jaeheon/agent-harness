@@ -14,7 +14,7 @@ function menuFor(state) {
   if (state === 'ABORTED' || state === 'DONE') return [['exit', 'Exit']];
   if (state === 'PLAN_LOOP') return [['continue', 'Continue'], ['abort', 'Abort']];
   if (state === 'AWAIT_PLAN_APPROVAL') return [['approve', 'Approve plan'], ['revise', 'Request revision'], ['abort', 'Abort']];
-  return [['abort', 'Abort']];
+  return [['abort', 'Abort'], ['exit', 'Exit']];
 }
 
 async function chooseRun(listed, ask, write) {
