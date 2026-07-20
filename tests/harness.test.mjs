@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -346,6 +346,33 @@ test('list finds taskSummary from the first locked SPEC heading', async (t) => {
 
   const listed = await runCommand(['list', '--repo', f.repo], { harnessRoot: f.harnessRoot });
   assert.equal(listed.runs[0].taskSummary, 'Locked task title');
+});
+
+test('list finds a damaged locked SPEC as an untitled saved task without blocking New task', async (t) => {
+  const f = await fixture(t);
+  const created = await initRun(f);
+  await unlink(path.join(f.harnessRoot, '.harness', 'runs', created.runId, 'SPEC.md'));
+
+  const listed = await runCommand(['list', '--repo', f.repo], { harnessRoot: f.harnessRoot });
+  assert.equal(listed.runs[0].taskSummary, 'Untitled task');
+  assert.deepEqual(listed.warnings, [{
+    runId: created.runId,
+    message: 'locked SPEC unavailable',
+  }]);
+
+  const calls = [];
+  const request = await launch({
+    cwd: f.repo,
+    runner: async (argv) => {
+      calls.push(argv);
+      if (argv[0] === 'list') return listed;
+      throw new Error(`unexpected runner call: ${argv[0]}`);
+    },
+    ask: async () => '1',
+    write: () => {},
+  });
+  assert.equal(request.type, 'start-claude-plan');
+  assert.deepEqual(calls, [['list', '--repo', f.repo]]);
 });
 
 test('list from a managed writer worktree selects only its owner run', async (t) => {
