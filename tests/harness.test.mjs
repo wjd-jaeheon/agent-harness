@@ -128,6 +128,45 @@ async function readRun(harnessRoot, runId) {
   return JSON.parse(await readFile(file, 'utf8'));
 }
 
+test('list finds no run, one run, and multiple active runs for a repo', async (t) => {
+  const f = await fixture(t);
+  assert.deepEqual((await runCommand(['list', '--repo', f.repo], { harnessRoot: f.harnessRoot })).runs, []);
+
+  const first = await initRun(f);
+  assert.equal((await runCommand(['list', '--repo', f.repo], { harnessRoot: f.harnessRoot })).selectedRunId, first.runId);
+
+  const second = await initRun(f);
+  const listed = await runCommand(['list', '--repo', f.repo], { harnessRoot: f.harnessRoot });
+  assert.equal(listed.selectedRunId, null);
+  assert.deepEqual(new Set(listed.runs.map((run) => run.runId)), new Set([first.runId, second.runId]));
+});
+
+test('list from a managed writer worktree selects only its owner run', async (t) => {
+  const f = await fixture(t);
+  const owner = await initRun(f);
+  await initRun(f);
+  const run = await readRun(f.harnessRoot, owner.runId);
+  const listed = await runCommand(['list', '--repo', run.worktree_path], { harnessRoot: f.harnessRoot });
+  assert.equal(listed.ownerRunId, owner.runId);
+  assert.equal(listed.selectedRunId, owner.runId);
+  assert.deepEqual(listed.runs.map((item) => item.runId), [owner.runId]);
+});
+
+test('start owns init then plan execution through the next human gate', async (t) => {
+  const f = await fixture(t);
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    { step: 'codex_plan_review', result: { review: review(1) } },
+  ]);
+  const result = await runCommand(['start', '--repo', f.repo, '--spec', f.specPath], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+  assert.equal(result.state, 'AWAIT_PLAN_APPROVAL');
+  assert.equal(scripted.queue.length, 0);
+});
+
 async function runToApproval(f) {
   const scripted = scriptedProvider([
     { step: 'cursor_scout', result: { scout } },

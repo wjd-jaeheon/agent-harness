@@ -4,6 +4,7 @@ import {
   appendFile,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rename,
   rm,
@@ -24,6 +25,7 @@ const TERMINAL_STATES = new Set([
   'ABORTED',
   'DONE',
 ]);
+const CLOSED_RUN_STATES = new Set(['ABORTED', 'DONE']);
 const DEFAULT_POLICY = {
   budgets: { plan_review_max: 2, human_plan_revision_max: 1 },
 };
@@ -362,6 +364,20 @@ async function gitOutput(gitExecutable, cwd, args) {
   return stdout.trim();
 }
 
+function pathKey(value) {
+  const resolved = path.resolve(value);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+async function gitContext(repo, gitExecutable) {
+  return {
+    topLevel: path.resolve(await gitOutput(gitExecutable, repo, ['rev-parse', '--show-toplevel'])),
+    commonDir: path.resolve(await gitOutput(gitExecutable, repo, [
+      'rev-parse', '--path-format=absolute', '--git-common-dir',
+    ])),
+  };
+}
+
 async function gitSnapshot(run, gitExecutable) {
   const head = await gitOutput(gitExecutable, run.worktree_path, ['rev-parse', 'HEAD']);
   const status = await gitOutput(gitExecutable, run.worktree_path, [
@@ -660,6 +676,52 @@ function summarize(run) {
     currentPlanSha: run.current_plan_sha,
     cursorScoutStatus: run.cursor.scout_status,
     lastError: run.last_error,
+  };
+}
+
+async function listRunsCommand(values, options) {
+  const repo = path.resolve(requireValue(values, 'repo'));
+  const context = await gitContext(repo, options.gitExecutable);
+  const runsDirectory = path.join(options.harnessRoot, '.harness', 'runs');
+  let runIds = [];
+  try {
+    runIds = await readdir(runsDirectory);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+
+  const warnings = [];
+  const runs = [];
+  let ownerRunId = null;
+  for (const runId of runIds) {
+    let run;
+    try {
+      run = await loadRun(options.harnessRoot, runId);
+    } catch (error) {
+      if (error.code === 'ENOENT') continue;
+      throw error;
+    }
+    if (CLOSED_RUN_STATES.has(run.state)) continue;
+    if (pathKey(run.worktree_path) === pathKey(repo)) {
+      ownerRunId = run.run_id;
+      runs.push({ ...summarize(run), repoPath: run.repo_path, worktreePath: run.worktree_path });
+      continue;
+    }
+    if (!(await exists(run.repo_path))) {
+      warnings.push({ runId: run.run_id, message: `stale repo path: ${run.repo_path}` });
+      continue;
+    }
+    if (pathKey((await gitContext(run.repo_path, options.gitExecutable)).commonDir) !== pathKey(context.commonDir)) continue;
+    runs.push({ ...summarize(run), repoPath: run.repo_path, worktreePath: run.worktree_path });
+  }
+
+  const ownedRun = ownerRunId ? runs.find((run) => run.runId === ownerRunId) : null;
+  return {
+    repoPath: context.topLevel,
+    ownerRunId,
+    selectedRunId: ownedRun ? ownerRunId : runs.length === 1 ? runs[0].runId : null,
+    runs: ownedRun ? [ownedRun] : runs,
+    warnings,
   };
 }
 
@@ -1201,6 +1263,11 @@ export async function runCommand(argv, options = {}) {
     });
   }
   if (command === 'init') return initCommand(values, resolved);
+  if (command === 'start') {
+    const created = await initCommand(values, resolved);
+    return runPlanLoop(await loadRun(resolved.harnessRoot, created.runId), resolved);
+  }
+  if (command === 'list') return listRunsCommand(values, resolved);
   if (command === 'status') return summarize(await loadRun(resolved.harnessRoot, requireValue(values, 'run')));
   if (command === 'run') {
     const run = await loadRun(resolved.harnessRoot, requireValue(values, 'run'));
