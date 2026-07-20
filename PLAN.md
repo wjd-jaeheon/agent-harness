@@ -388,6 +388,8 @@ v2.0은 Orca orchestration을 사용하지 않는다. Orca는 조작·관찰 화
 
 | 명령 | 역할 |
 |---|---|
+| list --repo <path> | 저장소의 run 목록과 exact owner 조회 |
+| start --repo <path> --spec <path> | init 후 다음 사람 gate까지 진행 |
 | init --repo <path> --spec <path> | 새 run과 writer worktree 생성 |
 | run --run <run-id> | 사람 gate·NEEDS_HUMAN·terminal까지 자동 진행 |
 | approve-plan --run <run-id> --plan-sha <sha> | exact PLAN·base SHA를 잠그고 구현 시작 |

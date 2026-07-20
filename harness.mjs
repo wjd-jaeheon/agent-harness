@@ -701,7 +701,7 @@ async function listRunsCommand(values, options) {
       if (error.code === 'ENOENT') continue;
       throw error;
     }
-    if (pathKey(run.worktree_path) === pathKey(repo)) {
+    if (pathKey(run.worktree_path) === pathKey(context.topLevel)) {
       ownerRunId = run.run_id;
       runs.push({ ...summarize(run), repoPath: run.repo_path, worktreePath: run.worktree_path });
       continue;
@@ -1239,6 +1239,7 @@ async function approvePlan(values, options) {
 
 async function abortRun(values, options) {
   const run = await loadRun(options.harnessRoot, requireValue(values, 'run'));
+  if (CLOSED_RUN_STATES.has(run.state)) throw new Error('run is already closed');
   const reason = requireValue(values, 'reason');
   run.last_error = reason;
   run.active_step = null;

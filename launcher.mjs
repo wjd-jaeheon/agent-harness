@@ -11,33 +11,44 @@ export function actionArgv(action, run, input = {}) {
 }
 
 function menuFor(state) {
+  if (state === 'ABORTED' || state === 'DONE') return [['exit', 'Exit']];
   if (state === 'PLAN_LOOP') return [['continue', 'Continue'], ['abort', 'Abort']];
   if (state === 'AWAIT_PLAN_APPROVAL') return [['approve', 'Approve plan'], ['revise', 'Request revision'], ['abort', 'Abort']];
-  return [['abort', 'Abort'], ['exit', 'Exit']];
+  return [['abort', 'Abort']];
 }
 
 async function chooseRun(listed, ask, write) {
   const runId = listed.ownerRunId ?? listed.selectedRunId;
-  if (runId) return runId;
-  listed.runs.forEach((run, index) => write(`${index + 1}. ${run.runId}`));
+  if (runId) return listed.runs.find((run) => run.runId === runId);
+  listed.runs.forEach((run, index) => {
+    write(`${index + 1}. ${run.runId} | ${run.state} | ${run.worktreePath}`);
+  });
   const selection = Number(await ask('Select a run: '));
   const run = listed.runs[selection - 1];
   if (!run) throw new Error('invalid run selection');
-  return run.runId;
+  return run;
 }
 
 export async function launch({ cwd = process.cwd(), runner = runCommand, ask, write = console.log } = {}) {
   if (!ask) throw new Error('launcher requires ask');
   const listed = await runner(['list', '--repo', cwd]);
+  for (const warning of listed.warnings ?? []) {
+    write(`Warning [${warning.runId}]: ${warning.message}`);
+  }
   if (listed.runs.length === 0) {
     const spec = await ask('SPEC path: ');
     if (!spec?.trim()) throw new Error('SPEC path is required');
-    return runner(['start', '--repo', cwd, '--spec', spec.trim()]);
+    return runner(['start', '--repo', listed.repoPath, '--spec', spec.trim()]);
   }
 
-  const runId = await chooseRun(listed, ask, write);
-  const run = await runner(['status', '--run', runId]);
+  const selected = await chooseRun(listed, ask, write);
+  write(`Selected: ${selected.runId} | ${selected.worktreePath}`);
+  const run = await runner(['status', '--run', selected.runId]);
   write(`State: ${run.state}${run.lastError ? `\nError: ${run.lastError}` : ''}`);
+  if (run.state === 'AWAIT_PLAN_APPROVAL') {
+    write(`Plan: ${run.currentPlanPath}`);
+    write(`Plan SHA: ${run.currentPlanSha}`);
+  }
   const menu = menuFor(run.state);
   menu.forEach(([, label], index) => write(`${index + 1}. ${label}`));
   const action = menu[Number(await ask('Select an action: ')) - 1]?.[0];

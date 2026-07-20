@@ -148,6 +148,109 @@ test('launcher invokes exactly one selected state-changing command', async () =>
   assert.equal(calls.filter((argv) => !['list', 'status'].includes(argv[0])).length, 1);
 });
 
+test('launcher prints warnings and starts from the canonical repo path returned by list', async () => {
+  const calls = [];
+  const output = [];
+  const runner = async (argv) => {
+    calls.push(argv);
+    if (argv[0] === 'list') {
+      return {
+        repoPath: 'D:\\repo',
+        ownerRunId: null,
+        selectedRunId: null,
+        runs: [],
+        warnings: [{ runId: 'stale-run', message: 'stale repo path: D:\\gone' }],
+      };
+    }
+    return { runId: 'r1', state: 'AWAIT_PLAN_APPROVAL' };
+  };
+  await launch({
+    cwd: 'D:\\repo\\nested',
+    runner,
+    ask: async () => 'D:\\repo\\SPEC.md',
+    write: (line) => output.push(line),
+  });
+  assert.equal(output[0], 'Warning [stale-run]: stale repo path: D:\\gone');
+  assert.deepEqual(calls.at(-1), [
+    'start', '--repo', 'D:\\repo', '--spec', 'D:\\repo\\SPEC.md',
+  ]);
+});
+
+test('launcher prints candidate and selected run context plus approval digest', async () => {
+  const output = [];
+  const answers = ['2', '1'];
+  const runner = async (argv) => {
+    if (argv[0] === 'list') {
+      return {
+        repoPath: 'D:\\repo',
+        ownerRunId: null,
+        selectedRunId: null,
+        runs: [
+          { runId: 'r1', state: 'PLAN_LOOP', worktreePath: 'D:\\worktrees\\r1' },
+          { runId: 'r2', state: 'AWAIT_PLAN_APPROVAL', worktreePath: 'D:\\worktrees\\r2' },
+        ],
+        warnings: [],
+      };
+    }
+    if (argv[0] === 'status') {
+      return {
+        runId: 'r2',
+        state: 'AWAIT_PLAN_APPROVAL',
+        currentPlanPath: 'plans/PLAN-v1.md',
+        currentPlanSha: 'a'.repeat(64),
+        lastError: null,
+      };
+    }
+    return { runId: 'r2', state: 'IMPLEMENT_LOOP' };
+  };
+  await launch({
+    cwd: 'D:\\repo',
+    runner,
+    ask: async () => answers.shift(),
+    write: (line) => output.push(line),
+  });
+  assert.ok(output.includes('1. r1 | PLAN_LOOP | D:\\worktrees\\r1'));
+  assert.ok(output.includes('2. r2 | AWAIT_PLAN_APPROVAL | D:\\worktrees\\r2'));
+  assert.ok(output.includes('Selected: r2 | D:\\worktrees\\r2'));
+  assert.ok(output.includes('Plan: plans/PLAN-v1.md'));
+  assert.ok(output.includes(`Plan SHA: ${'a'.repeat(64)}`));
+});
+
+test('launcher reserves Exit for closed runs', async () => {
+  for (const state of ['ABORTED', 'DONE', 'NEEDS_HUMAN']) {
+    const calls = [];
+    const output = [];
+    const answers = ['1', 'stop'];
+    const runner = async (argv) => {
+      calls.push(argv);
+      if (argv[0] === 'list') {
+        return {
+          repoPath: 'D:\\repo',
+          ownerRunId: 'r1',
+          selectedRunId: 'r1',
+          runs: [{ runId: 'r1', state, worktreePath: 'D:\\worktrees\\r1' }],
+          warnings: [],
+        };
+      }
+      return { runId: 'r1', state, lastError: null };
+    };
+    await launch({
+      cwd: 'D:\\repo',
+      runner,
+      ask: async () => answers.shift(),
+      write: (line) => output.push(line),
+    });
+    const closed = state === 'ABORTED' || state === 'DONE';
+    assert.equal(output.includes('1. Exit'), closed);
+    assert.equal(output.includes('1. Abort'), !closed);
+    assert.equal(output.some((line) => line.startsWith('2. ')), false);
+    assert.deepEqual(
+      calls.map((argv) => argv[0]),
+      closed ? ['list', 'status'] : ['list', 'status', 'abort'],
+    );
+  }
+});
+
 test('launcher approval records the same approval transition as raw argv', async (t) => {
   const launcherFixture = await fixture(t);
   const rawFixture = await fixture(t);
@@ -215,15 +318,47 @@ test('list from a managed writer worktree selects only its owner run', async (t)
   assert.deepEqual(listed.runs.map((item) => item.runId), [owner.runId]);
 });
 
-test('list from an aborted writer worktree still selects its owner run', async (t) => {
+test('list from a nested directory in an aborted writer worktree selects its owner run', async (t) => {
   const f = await fixture(t);
   const owner = await initRun(f);
   await runCommand(['abort', '--run', owner.runId, '--reason', 'stopped'], { harnessRoot: f.harnessRoot });
   const run = await readRun(f.harnessRoot, owner.runId);
-  const listed = await runCommand(['list', '--repo', run.worktree_path], { harnessRoot: f.harnessRoot });
+  const nested = path.join(run.worktree_path, 'nested');
+  await mkdir(nested);
+  const listed = await runCommand(['list', '--repo', nested], { harnessRoot: f.harnessRoot });
   assert.equal(listed.ownerRunId, owner.runId);
   assert.equal(listed.selectedRunId, owner.runId);
   assert.deepEqual(listed.runs.map((item) => item.runId), [owner.runId]);
+});
+
+test('abort rejects closed runs without changing run state or events', async (t) => {
+  const f = await fixture(t);
+  const assertImmutable = async (runId) => {
+    const root = path.join(f.harnessRoot, '.harness', 'runs', runId);
+    const runPath = path.join(root, 'run.json');
+    const eventsPath = path.join(root, 'events.jsonl');
+    const beforeRun = await readFile(runPath, 'utf8');
+    const beforeEvents = await readFile(eventsPath, 'utf8');
+    await assert.rejects(
+      runCommand(['abort', '--run', runId, '--reason', 'again'], { harnessRoot: f.harnessRoot }),
+      /run is already closed/,
+    );
+    assert.equal(await readFile(runPath, 'utf8'), beforeRun);
+    assert.equal(await readFile(eventsPath, 'utf8'), beforeEvents);
+  };
+
+  const aborted = await initRun(f);
+  await runCommand(['abort', '--run', aborted.runId, '--reason', 'stopped'], {
+    harnessRoot: f.harnessRoot,
+  });
+  await assertImmutable(aborted.runId);
+
+  const done = await initRun(f);
+  const donePath = path.join(f.harnessRoot, '.harness', 'runs', done.runId, 'run.json');
+  const doneRun = await readRun(f.harnessRoot, done.runId);
+  doneRun.state = 'DONE';
+  await writeFile(donePath, `${JSON.stringify(doneRun, null, 2)}\n`, 'utf8');
+  await assertImmutable(done.runId);
 });
 
 test('start owns init then plan execution through the next human gate', async (t) => {
