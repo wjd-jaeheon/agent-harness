@@ -52,6 +52,8 @@ Scope: Global
 
 ## 4. Fallback: raw runner commands
 
+`Harness` first shows a choice to start a new interactive Claude plan or resume a named saved task. New task opens Claude in the selected repository with `--permission-mode plan`; it asks what to plan, makes no implementation, and waits for plan approval. This change does not automatically import that interactive plan into the Codex review loop.
+
 ```powershell
 Set-Location D:\codex-projects\agent-harness
 

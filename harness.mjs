@@ -679,6 +679,21 @@ function summarize(run) {
   };
 }
 
+async function taskSummary(harnessRoot, runId) {
+  const spec = (await readFile(path.join(runRoot(harnessRoot, runId), 'SPEC.md'), 'utf8')).replace(/^\uFEFF/, '');
+  const heading = spec.match(/^\s{0,3}#{1,6}\s+(.+?)(?:\s+#+)?\s*$/m);
+  return heading?.[1].trim() || 'Untitled task';
+}
+
+async function listEntry(harnessRoot, run) {
+  return {
+    ...summarize(run),
+    taskSummary: await taskSummary(harnessRoot, run.run_id),
+    repoPath: run.repo_path,
+    worktreePath: run.worktree_path,
+  };
+}
+
 async function listRunsCommand(values, options) {
   const repo = path.resolve(requireValue(values, 'repo'));
   const context = await gitContext(repo, options.gitExecutable);
@@ -703,7 +718,7 @@ async function listRunsCommand(values, options) {
     }
     if (pathKey(run.worktree_path) === pathKey(context.topLevel)) {
       ownerRunId = run.run_id;
-      runs.push({ ...summarize(run), repoPath: run.repo_path, worktreePath: run.worktree_path });
+      runs.push(await listEntry(options.harnessRoot, run));
       continue;
     }
     if (CLOSED_RUN_STATES.has(run.state)) continue;
@@ -712,7 +727,7 @@ async function listRunsCommand(values, options) {
       continue;
     }
     if (pathKey((await gitContext(run.repo_path, options.gitExecutable)).commonDir) !== pathKey(context.commonDir)) continue;
-    runs.push({ ...summarize(run), repoPath: run.repo_path, worktreePath: run.worktree_path });
+    runs.push(await listEntry(options.harnessRoot, run));
   }
 
   const ownedRun = ownerRunId ? runs.find((run) => run.runId === ownerRunId) : null;

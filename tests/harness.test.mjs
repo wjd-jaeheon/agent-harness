@@ -135,59 +135,84 @@ test('launcher approval maps to one exact approve-plan command', async () => {
   ]);
 });
 
-test('launcher invokes exactly one selected state-changing command', async () => {
+test('launcher starts a new Claude plan without inspecting the saved run', async () => {
   const calls = [];
-  const runner = async (argv) => {
-    calls.push(argv);
-    if (argv[0] === 'list') return { ownerRunId: null, selectedRunId: 'r1', runs: [{ runId: 'r1' }], warnings: [] };
-    if (argv[0] === 'status') return { runId: 'r1', state: 'AWAIT_PLAN_APPROVAL', currentPlanSha: 'a'.repeat(64) };
-    return { runId: 'r1', state: 'IMPLEMENT_LOOP' };
-  };
-  await launch({ cwd: 'D:\\repo', runner, ask: async () => '1', write: () => {} });
-  assert.deepEqual(calls.at(-1), ['approve-plan', '--run', 'r1', '--plan-sha', 'a'.repeat(64)]);
-  assert.equal(calls.filter((argv) => !['list', 'status'].includes(argv[0])).length, 1);
-});
-
-test('launcher prints warnings and starts from the canonical repo path returned by list', async () => {
-  const calls = [];
-  const output = [];
   const runner = async (argv) => {
     calls.push(argv);
     if (argv[0] === 'list') {
       return {
         repoPath: 'D:\\repo',
-        ownerRunId: null,
-        selectedRunId: null,
-        runs: [],
-        warnings: [{ runId: 'stale-run', message: 'stale repo path: D:\\gone' }],
+        runs: [{ runId: 'r1', taskSummary: 'Saved task', state: 'AWAIT_PLAN_APPROVAL' }],
+        warnings: [],
       };
     }
-    return { runId: 'r1', state: 'AWAIT_PLAN_APPROVAL' };
+    throw new Error(`unexpected runner call: ${argv[0]}`);
   };
-  await launch({
-    cwd: 'D:\\repo\\nested',
-    runner,
-    ask: async () => 'D:\\repo\\SPEC.md',
-    write: (line) => output.push(line),
-  });
-  assert.equal(output[0], 'Warning [stale-run]: stale repo path: D:\\gone');
-  assert.deepEqual(calls.at(-1), [
-    'start', '--repo', 'D:\\repo', '--spec', 'D:\\repo\\SPEC.md',
-  ]);
+  const request = await launch({ cwd: 'D:\\repo', runner, ask: async () => '1', write: () => {} });
+  assert.equal(request.type, 'start-claude-plan');
+  assert.deepEqual(calls, [['list', '--repo', 'D:\\repo']]);
 });
 
-test('launcher prints candidate and selected run context plus approval digest', async () => {
+test('launcher displays a saved SPEC title before resuming it', async () => {
+  const calls = [];
   const output = [];
   const answers = ['2', '1'];
   const runner = async (argv) => {
+    calls.push(argv);
     if (argv[0] === 'list') {
       return {
         repoPath: 'D:\\repo',
-        ownerRunId: null,
-        selectedRunId: null,
+        runs: [{
+          runId: 'r1',
+          taskSummary: 'Saved SPEC title',
+          state: 'AWAIT_PLAN_APPROVAL',
+          worktreePath: 'D:\\worktrees\\r1',
+        }],
+        warnings: [{ runId: 'stale-run', message: 'stale repo path: D:\\gone' }],
+      };
+    }
+    if (argv[0] === 'status') {
+      return { runId: 'r1', state: 'AWAIT_PLAN_APPROVAL', currentPlanSha: 'a'.repeat(64) };
+    }
+    return { runId: 'r1', state: 'IMPLEMENT_LOOP' };
+  };
+  await launch({
+    cwd: 'D:\\repo',
+    runner,
+    ask: async () => answers.shift(),
+    write: (line) => output.push(line),
+  });
+  assert.equal(output[0], 'Warning [stale-run]: stale repo path: D:\\gone');
+  assert.ok(output.includes('2. Resume saved task: Saved SPEC title [AWAIT_PLAN_APPROVAL]'));
+  assert.deepEqual(calls.at(-1), ['approve-plan', '--run', 'r1', '--plan-sha', 'a'.repeat(64)]);
+});
+
+test('launcher exit calls only list', async () => {
+  const calls = [];
+  const runner = async (argv) => {
+    calls.push(argv);
+    return {
+      repoPath: 'D:\\repo',
+      runs: [{ runId: 'r1', taskSummary: 'Saved task', state: 'PLAN_LOOP' }],
+      warnings: [],
+    };
+  };
+  await launch({ cwd: 'D:\\repo', runner, ask: async () => '3', write: () => {} });
+  assert.deepEqual(calls, [['list', '--repo', 'D:\\repo']]);
+});
+
+test('launcher invokes exactly one selected state-changing command after explicit resume', async () => {
+  const output = [];
+  const calls = [];
+  const answers = ['3', '1'];
+  const runner = async (argv) => {
+    calls.push(argv);
+    if (argv[0] === 'list') {
+      return {
+        repoPath: 'D:\\repo',
         runs: [
-          { runId: 'r1', state: 'PLAN_LOOP', worktreePath: 'D:\\worktrees\\r1' },
-          { runId: 'r2', state: 'AWAIT_PLAN_APPROVAL', worktreePath: 'D:\\worktrees\\r2' },
+          { runId: 'r1', taskSummary: 'First task', state: 'PLAN_LOOP', worktreePath: 'D:\\worktrees\\r1' },
+          { runId: 'r2', taskSummary: 'Second task', state: 'AWAIT_PLAN_APPROVAL', worktreePath: 'D:\\worktrees\\r2' },
         ],
         warnings: [],
       };
@@ -209,26 +234,28 @@ test('launcher prints candidate and selected run context plus approval digest', 
     ask: async () => answers.shift(),
     write: (line) => output.push(line),
   });
-  assert.ok(output.includes('1. r1 | PLAN_LOOP | D:\\worktrees\\r1'));
-  assert.ok(output.includes('2. r2 | AWAIT_PLAN_APPROVAL | D:\\worktrees\\r2'));
+  assert.ok(output.includes('1. New task with Claude'));
+  assert.ok(output.includes('2. Resume saved task: First task [PLAN_LOOP]'));
+  assert.ok(output.includes('3. Resume saved task: Second task [AWAIT_PLAN_APPROVAL]'));
+  assert.ok(output.includes('4. Exit'));
   assert.ok(output.includes('Selected: r2 | D:\\worktrees\\r2'));
   assert.ok(output.includes('Plan: plans/PLAN-v1.md'));
   assert.ok(output.includes(`Plan SHA: ${'a'.repeat(64)}`));
+  assert.deepEqual(calls.at(-1), ['approve-plan', '--run', 'r2', '--plan-sha', 'a'.repeat(64)]);
+  assert.equal(calls.filter((argv) => !['list', 'status'].includes(argv[0])).length, 1);
 });
 
 test('launcher keeps Abort and Exit for non-closed fallback states', async () => {
   for (const state of ['ABORTED', 'DONE', 'NEEDS_HUMAN', 'IMPLEMENT_LOOP']) {
     const calls = [];
     const output = [];
-    const answers = ['1', 'stop'];
+    const answers = ['2', '1', 'stop'];
     const runner = async (argv) => {
       calls.push(argv);
       if (argv[0] === 'list') {
         return {
           repoPath: 'D:\\repo',
-          ownerRunId: 'r1',
-          selectedRunId: 'r1',
-          runs: [{ runId: 'r1', state, worktreePath: 'D:\\worktrees\\r1' }],
+          runs: [{ runId: 'r1', taskSummary: 'Saved task', state, worktreePath: 'D:\\worktrees\\r1' }],
           warnings: [],
         };
       }
@@ -242,7 +269,7 @@ test('launcher keeps Abort and Exit for non-closed fallback states', async () =>
     });
     const closed = state === 'ABORTED' || state === 'DONE';
     assert.deepEqual(
-      output.filter((line) => /^\d+\. /.test(line)),
+      output.filter((line) => /^\d+\. /.test(line)).slice(closed ? -1 : -2),
       closed ? ['1. Exit'] : ['1. Abort', '2. Exit'],
     );
     assert.deepEqual(
@@ -300,12 +327,25 @@ test('list finds no run, one run, and multiple active runs for a repo', async (t
   assert.deepEqual((await runCommand(['list', '--repo', f.repo], { harnessRoot: f.harnessRoot })).runs, []);
 
   const first = await initRun(f);
-  assert.equal((await runCommand(['list', '--repo', f.repo], { harnessRoot: f.harnessRoot })).selectedRunId, first.runId);
+  const single = await runCommand(['list', '--repo', f.repo], { harnessRoot: f.harnessRoot });
+  assert.equal(single.selectedRunId, first.runId);
+  assert.equal(single.runs[0].taskSummary, 'Toy SPEC');
 
   const second = await initRun(f);
   const listed = await runCommand(['list', '--repo', f.repo], { harnessRoot: f.harnessRoot });
   assert.equal(listed.selectedRunId, null);
   assert.deepEqual(new Set(listed.runs.map((run) => run.runId)), new Set([first.runId, second.runId]));
+});
+
+test('list finds taskSummary from the first locked SPEC heading', async (t) => {
+  const f = await fixture(t);
+  const created = await initRun(f);
+  const lockedSpec = path.join(f.harnessRoot, '.harness', 'runs', created.runId, 'SPEC.md');
+  await writeFile(f.specPath, '# Changed source SPEC\n\nAC-001: changed\n\nCMD-001: changed\n', 'utf8');
+  await writeFile(lockedSpec, '\uFEFF  ## Locked task title\n\nAC-001: update app\n\nCMD-001: verify app\n', 'utf8');
+
+  const listed = await runCommand(['list', '--repo', f.repo], { harnessRoot: f.harnessRoot });
+  assert.equal(listed.runs[0].taskSummary, 'Locked task title');
 });
 
 test('list from a managed writer worktree selects only its owner run', async (t) => {
