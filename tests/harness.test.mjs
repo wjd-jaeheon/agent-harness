@@ -12,6 +12,7 @@ import {
   runProcess,
   sha256Bytes,
 } from '../harness.mjs';
+import { actionArgv, launch } from '../launcher.mjs';
 
 const exec = promisify(execFile);
 
@@ -127,6 +128,58 @@ async function readRun(harnessRoot, runId) {
   const file = path.join(harnessRoot, '.harness', 'runs', runId, 'run.json');
   return JSON.parse(await readFile(file, 'utf8'));
 }
+
+test('launcher approval maps to one exact approve-plan command', async () => {
+  assert.deepEqual(actionArgv('approve', { runId: 'r1', currentPlanSha: 'a'.repeat(64) }), [
+    'approve-plan', '--run', 'r1', '--plan-sha', 'a'.repeat(64),
+  ]);
+});
+
+test('launcher invokes exactly one selected state-changing command', async () => {
+  const calls = [];
+  const runner = async (argv) => {
+    calls.push(argv);
+    if (argv[0] === 'list') return { ownerRunId: null, selectedRunId: 'r1', runs: [{ runId: 'r1' }], warnings: [] };
+    if (argv[0] === 'status') return { runId: 'r1', state: 'AWAIT_PLAN_APPROVAL', currentPlanSha: 'a'.repeat(64) };
+    return { runId: 'r1', state: 'IMPLEMENT_LOOP' };
+  };
+  await launch({ cwd: 'D:\\repo', runner, ask: async () => '1', write: () => {} });
+  assert.deepEqual(calls.at(-1), ['approve-plan', '--run', 'r1', '--plan-sha', 'a'.repeat(64)]);
+  assert.equal(calls.filter((argv) => !['list', 'status'].includes(argv[0])).length, 1);
+});
+
+test('launcher approval records the same approval transition as raw argv', async (t) => {
+  const f = await fixture(t);
+  const approvalRun = async () => {
+    const scripted = scriptedProvider([
+      { step: 'cursor_scout', result: { scout } },
+      { step: 'claude_plan', result: { plan: planV1 } },
+      { step: 'codex_plan_review', result: { review: review(1) } },
+    ]);
+    return runCommand(['start', '--repo', f.repo, '--spec', f.specPath], {
+      harnessRoot: f.harnessRoot,
+      providerRunner: scripted.providerRunner,
+    });
+  };
+  const viaLauncher = await approvalRun();
+  const raw = await approvalRun();
+  await runCommand(actionArgv('approve', viaLauncher), { harnessRoot: f.harnessRoot });
+  await runCommand(['approve-plan', '--run', raw.runId, '--plan-sha', raw.currentPlanSha], { harnessRoot: f.harnessRoot });
+
+  const approvalFields = ({ state, approved_plan_path, approved_plan_sha, approved_base_sha }) => ({
+    state, approved_plan_path, approved_plan_sha, approved_base_sha,
+  });
+  const transitionFields = ({ previous_state, state, action, result }) => ({
+    previous_state, state, action, result,
+  });
+  const events = async (runId) => JSON.parse((await readFile(
+    path.join(f.harnessRoot, '.harness', 'runs', runId, 'events.jsonl'), 'utf8',
+  )).trim().split('\n').at(-1));
+  const viaLauncherRun = await readRun(f.harnessRoot, viaLauncher.runId);
+  const rawRun = await readRun(f.harnessRoot, raw.runId);
+  assert.deepEqual(approvalFields(viaLauncherRun), approvalFields(rawRun));
+  assert.deepEqual(transitionFields(await events(viaLauncher.runId)), transitionFields(await events(raw.runId)));
+});
 
 test('list finds no run, one run, and multiple active runs for a repo', async (t) => {
   const f = await fixture(t);
