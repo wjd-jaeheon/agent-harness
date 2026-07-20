@@ -149,8 +149,15 @@ test('launcher invokes exactly one selected state-changing command', async () =>
 });
 
 test('launcher approval records the same approval transition as raw argv', async (t) => {
-  const f = await fixture(t);
-  const approvalRun = async () => {
+  const launcherFixture = await fixture(t);
+  const rawFixture = await fixture(t);
+  assert.notEqual(launcherFixture.harnessRoot, rawFixture.harnessRoot);
+  assert.notEqual(launcherFixture.repo, rawFixture.repo);
+  const sharedBase = await git(launcherFixture.repo, 'rev-parse', 'HEAD');
+  await git(rawFixture.repo, 'fetch', launcherFixture.repo, sharedBase);
+  await git(rawFixture.repo, 'checkout', '--detach', sharedBase);
+
+  const approvalRun = async (f) => {
     const scripted = scriptedProvider([
       { step: 'cursor_scout', result: { scout } },
       { step: 'claude_plan', result: { plan: planV1 } },
@@ -161,10 +168,10 @@ test('launcher approval records the same approval transition as raw argv', async
       providerRunner: scripted.providerRunner,
     });
   };
-  const viaLauncher = await approvalRun();
-  const raw = await approvalRun();
-  await runCommand(actionArgv('approve', viaLauncher), { harnessRoot: f.harnessRoot });
-  await runCommand(['approve-plan', '--run', raw.runId, '--plan-sha', raw.currentPlanSha], { harnessRoot: f.harnessRoot });
+  const viaLauncher = await approvalRun(launcherFixture);
+  const raw = await approvalRun(rawFixture);
+  await runCommand(actionArgv('approve', viaLauncher), { harnessRoot: launcherFixture.harnessRoot });
+  await runCommand(['approve-plan', '--run', raw.runId, '--plan-sha', raw.currentPlanSha], { harnessRoot: rawFixture.harnessRoot });
 
   const approvalFields = ({ state, approved_plan_path, approved_plan_sha, approved_base_sha }) => ({
     state, approved_plan_path, approved_plan_sha, approved_base_sha,
@@ -172,13 +179,16 @@ test('launcher approval records the same approval transition as raw argv', async
   const transitionFields = ({ previous_state, state, action, result }) => ({
     previous_state, state, action, result,
   });
-  const events = async (runId) => JSON.parse((await readFile(
+  const events = async (f, runId) => JSON.parse((await readFile(
     path.join(f.harnessRoot, '.harness', 'runs', runId, 'events.jsonl'), 'utf8',
   )).trim().split('\n').at(-1));
-  const viaLauncherRun = await readRun(f.harnessRoot, viaLauncher.runId);
-  const rawRun = await readRun(f.harnessRoot, raw.runId);
+  const viaLauncherRun = await readRun(launcherFixture.harnessRoot, viaLauncher.runId);
+  const rawRun = await readRun(rawFixture.harnessRoot, raw.runId);
   assert.deepEqual(approvalFields(viaLauncherRun), approvalFields(rawRun));
-  assert.deepEqual(transitionFields(await events(viaLauncher.runId)), transitionFields(await events(raw.runId)));
+  assert.deepEqual(
+    transitionFields(await events(launcherFixture, viaLauncher.runId)),
+    transitionFields(await events(rawFixture, raw.runId)),
+  );
 });
 
 test('list finds no run, one run, and multiple active runs for a repo', async (t) => {
