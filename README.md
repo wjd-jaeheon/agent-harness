@@ -12,6 +12,8 @@ Cursor Scout 1회
 → IMPLEMENT_LOOP에서 정지
 ```
 
+Phase 1 currently stops after `IMPLEMENT_LOOP`; it does not implement the target repository's source code.
+
 Phase 1은 대상 저장소의 소스 코드를 수정하지 않는다. 실제 Codex 구현과 Claude 코드 리뷰 루프는 다음 단계에서 붙인다.
 
 ## 1. 최초 1회 확인
@@ -37,7 +39,18 @@ Orca에서는 Agent Permissions를 `Manual`로 두고 custom args에 `--dangerou
 
 [SPEC.example.md](./SPEC.example.md)를 복사해 실제 요청, `AC-###`, `CMD-###`를 적는다. 첫 파일럿은 30~90분 안에 끝낼 수 있는 작은 Git 저장소 작업을 권장한다.
 
-## 3. Orca Control terminal에서 시작
+## 3. Orca Global Quick Command에서 시작
+
+```text
+Settings > Quick Commands
+Label: Harness
+Command: node "D:\codex-projects\agent-harness\launcher.mjs"
+Scope: Global
+```
+
+대상 저장소의 worktree에서 Global Quick Command `Harness`를 실행한다. 현재 worktree가 runner가 만든 exact writer worktree이면 launcher는 그 소유 run만 사용한다. 같은 저장소의 활성 run이 여러 개면 자동 선택하지 않고 사람이 하나를 고른다. Orca에서 숨겨진 external writer worktree는 프로젝트 메뉴에서 숨김을 해제한 뒤 import 또는 표시한다.
+
+## 4. Fallback: raw runner commands
 
 ```powershell
 Set-Location D:\codex-projects\agent-harness
@@ -60,7 +73,7 @@ node .\harness.mjs status --run $run
 - `AWAIT_PLAN_APPROVAL`: 계획 검토 가능
 - `NEEDS_HUMAN`: 예산 소진 또는 경계 위반. `lastError` 확인
 
-## 4. 계획 읽고 결정
+## 5. 계획 읽고 결정
 
 `status` 출력의 `currentPlanPath`, `currentPlanSha`를 사용한다. 실제 파일은 다음 아래에 있다.
 
@@ -96,7 +109,7 @@ node .\harness.mjs run --run $run
 node .\harness.mjs abort --run $run --reason 'scope changed'
 ```
 
-## 5. 재부팅 뒤 재개
+## 6. 재부팅 뒤 재개
 
 같은 명령만 다시 실행한다. 이미 완료된 Scout·계획·리뷰는 다시 호출하지 않고, 중단된 read-only 단계만 허용된 범위에서 복구한다.
 

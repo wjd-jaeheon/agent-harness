@@ -72,7 +72,7 @@ v2.0에서는 다음을 만들지 않는다.
 ### 실행 구조
 
     Orca
-    ├─ Control terminal: node harness.mjs ...
+    ├─ Orca Global Quick Command or /harness → launcher → runner
     ├─ Codex writer worktree
     ├─ Claude review pane
     └─ diff·commit 관찰
@@ -364,14 +364,23 @@ blocker/major에는 입력 또는 조건에서 잘못된 결과로 이어지는 
 
 ## 6. Orca 운영
 
-모든 사람 조작은 Orca에서 한다.
+runner is the only state-transition surface. Orca and `/harness` only open the shared launcher.
 
 1. Orca에 agent-harness와 대상 저장소를 등록한다.
 2. Agent Permissions를 Manual로 둔다.
 3. custom arguments에서 bypass, yolo 계열 플래그를 제거한다.
-4. Control terminal에서 harness 명령을 실행한다.
-5. Codex writer worktree, Claude review pane, diff viewer를 같은 run 단위로 연다.
-6. 사람 승인과 resolve는 Orca Control terminal에서만 실행한다.
+4. Settings > Quick Commands에 아래 Global Quick Command를 등록한다.
+
+   ```text
+   Settings > Quick Commands
+   Label: Harness
+   Command: node "D:\codex-projects\agent-harness\launcher.mjs"
+   Scope: Global
+   ```
+
+5. 대상 저장소의 worktree에서 `Harness`를 실행한다. launcher가 exact writer worktree이면 그 소유 run만 선택하고, 같은 저장소의 활성 run이 여러 개면 반드시 사람이 하나를 선택한다.
+6. Codex writer worktree, Claude review pane, diff viewer를 같은 run 단위로 연다. Orca에서 숨겨진 external writer worktree는 프로젝트 메뉴에서 숨김을 해제한 뒤 import 또는 표시한다.
+7. 사람 승인과 resolve는 launcher가 호출하는 공개 runner 명령으로만 상태를 바꾼다.
 
 v2.0은 Orca orchestration을 사용하지 않는다. Orca는 조작·관찰 화면이며 runner 상태의 정본이 아니다. Orca 종료 후 다시 열어 status와 run만 실행하면 이어져야 한다.
 
@@ -391,7 +400,7 @@ v2.0은 Orca orchestration을 사용하지 않는다. Orca는 조작·관찰 화
 | complete --run <run-id> --merged-sha <sha> | 사람 머지 뒤 DONE 기록 |
 | abort --run <run-id> --reason <text> | 현재 run 보존 종료 |
 
-v2.0은 Claude slash command를 만들지 않는다. Orca Control terminal의 runner 명령이 유일한 조작 표면이다.
+The Global Quick Command and optional `/harness` Skill are entrypoints to the same launcher; the runner remains the only state-transition surface.
 
 ## 8. 구독 인증과 CLI 경계
 
