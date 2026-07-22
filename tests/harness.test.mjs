@@ -135,28 +135,41 @@ test('launcher approval maps to one exact approve-plan command', async () => {
   ]);
 });
 
-test('launcher starts a new Claude plan without inspecting the saved run', async () => {
-  const calls = [];
-  const runner = async (argv) => {
-    calls.push(argv);
-    if (argv[0] === 'list') {
-      return {
-        repoPath: 'D:\\repo',
-        runs: [{ runId: 'r1', taskSummary: 'Saved task', state: 'AWAIT_PLAN_APPROVAL' }],
-        warnings: [],
-      };
-    }
-    throw new Error(`unexpected runner call: ${argv[0]}`);
-  };
-  const request = await launch({ cwd: 'D:\\repo', runner, ask: async () => '1', write: () => {} });
-  assert.equal(request.type, 'start-claude-plan');
-  assert.deepEqual(calls, [['list', '--repo', 'D:\\repo']]);
+test('tracked pingpong skill connects a task to the public plan runner', async () => {
+  const skill = await readFile(
+    new URL('../integrations/claude/pingpong/SKILL.md', import.meta.url),
+    'utf8',
+  );
+  assert.match(skill, /^name: pingpong$/m);
+  assert.match(skill, /^disable-model-invocation: true$/m);
+  assert.match(skill, /\$ARGUMENTS/);
+  assert.match(skill, /무슨 작업을 계획할까요\?/);
+  assert.match(skill, /harness\.mjs"?\s+start --repo/);
+  assert.match(skill, /pingpong resume/);
+  assert.match(skill, /사용자가 명시한 저장소.*현재 Git root.*다르면/s);
+  assert.match(skill, /\$env:TEMP/);
+  assert.doesNotMatch(skill, /\.harness\/inputs/);
+  assert.match(skill, /\.harness\/runs\/<runId>\/<currentPlanPath>/);
+  assert.match(skill, /runner.*상태 전이/s);
+  assert.doesNotMatch(skill.split('## 새 작업 시작')[1], /launcher\.mjs/);
+});
+
+test('launcher has no disconnected new-task path', async () => {
+  const output = [];
+  const result = await launch({
+    cwd: 'D:\\repo',
+    runner: async () => ({ repoPath: 'D:\\repo', runs: [], warnings: [] }),
+    ask: async () => { throw new Error('launcher must not ask for a new task'); },
+    write: (line) => output.push(line),
+  });
+  assert.deepEqual(result, { type: 'exit' });
+  assert.deepEqual(output, ['저장된 작업이 없습니다. 새 작업은 Claude Code에서 /pingpong <작업 설명>으로 시작하세요.']);
 });
 
 test('launcher displays a saved SPEC title before resuming it', async () => {
   const calls = [];
   const output = [];
-  const answers = ['2', '1'];
+  const answers = ['1', '1'];
   const runner = async (argv) => {
     calls.push(argv);
     if (argv[0] === 'list') {
@@ -182,8 +195,8 @@ test('launcher displays a saved SPEC title before resuming it', async () => {
     ask: async () => answers.shift(),
     write: (line) => output.push(line),
   });
-  assert.equal(output[0], 'Warning [stale-run]: stale repo path: D:\\gone');
-  assert.ok(output.includes('2. Resume saved task: Saved SPEC title [AWAIT_PLAN_APPROVAL]'));
+  assert.equal(output[0], '경고 [stale-run]: stale repo path: D:\\gone');
+  assert.ok(output.includes('1. 저장 작업 이어가기: Saved SPEC title [AWAIT_PLAN_APPROVAL]'));
   assert.deepEqual(calls.at(-1), ['approve-plan', '--run', 'r1', '--plan-sha', 'a'.repeat(64)]);
 });
 
@@ -197,14 +210,14 @@ test('launcher exit calls only list', async () => {
       warnings: [],
     };
   };
-  await launch({ cwd: 'D:\\repo', runner, ask: async () => '3', write: () => {} });
+  await launch({ cwd: 'D:\\repo', runner, ask: async () => '2', write: () => {} });
   assert.deepEqual(calls, [['list', '--repo', 'D:\\repo']]);
 });
 
 test('launcher invokes exactly one selected state-changing command after explicit resume', async () => {
   const output = [];
   const calls = [];
-  const answers = ['3', '1'];
+  const answers = ['2', '1'];
   const runner = async (argv) => {
     calls.push(argv);
     if (argv[0] === 'list') {
@@ -234,13 +247,12 @@ test('launcher invokes exactly one selected state-changing command after explici
     ask: async () => answers.shift(),
     write: (line) => output.push(line),
   });
-  assert.ok(output.includes('1. New task with Claude'));
-  assert.ok(output.includes('2. Resume saved task: First task [PLAN_LOOP]'));
-  assert.ok(output.includes('3. Resume saved task: Second task [AWAIT_PLAN_APPROVAL]'));
-  assert.ok(output.includes('4. Exit'));
-  assert.ok(output.includes('Selected: r2 | D:\\worktrees\\r2'));
-  assert.ok(output.includes('Plan: plans/PLAN-v1.md'));
-  assert.ok(output.includes(`Plan SHA: ${'a'.repeat(64)}`));
+  assert.ok(output.includes('1. 저장 작업 이어가기: First task [PLAN_LOOP]'));
+  assert.ok(output.includes('2. 저장 작업 이어가기: Second task [AWAIT_PLAN_APPROVAL]'));
+  assert.ok(output.includes('3. 종료'));
+  assert.ok(output.includes('선택: r2 | D:\\worktrees\\r2'));
+  assert.ok(output.includes('계획: plans/PLAN-v1.md'));
+  assert.ok(output.includes(`계획 SHA: ${'a'.repeat(64)}`));
   assert.deepEqual(calls.at(-1), ['approve-plan', '--run', 'r2', '--plan-sha', 'a'.repeat(64)]);
   assert.equal(calls.filter((argv) => !['list', 'status'].includes(argv[0])).length, 1);
 });
@@ -249,7 +261,7 @@ test('launcher keeps Abort and Exit for non-closed fallback states', async () =>
   for (const state of ['ABORTED', 'DONE', 'NEEDS_HUMAN', 'IMPLEMENT_LOOP']) {
     const calls = [];
     const output = [];
-    const answers = ['2', '1', 'stop'];
+    const answers = ['1', '1', 'stop'];
     const runner = async (argv) => {
       calls.push(argv);
       if (argv[0] === 'list') {
@@ -270,7 +282,7 @@ test('launcher keeps Abort and Exit for non-closed fallback states', async () =>
     const closed = state === 'ABORTED' || state === 'DONE';
     assert.deepEqual(
       output.filter((line) => /^\d+\. /.test(line)).slice(closed ? -1 : -2),
-      closed ? ['1. Exit'] : ['1. Abort', '2. Exit'],
+      closed ? ['1. 종료'] : ['1. 중단', '2. 종료'],
     );
     assert.deepEqual(
       calls.map((argv) => argv[0]),
@@ -348,7 +360,7 @@ test('list finds taskSummary from the first locked SPEC heading', async (t) => {
   assert.equal(listed.runs[0].taskSummary, 'Locked task title');
 });
 
-test('list finds a damaged locked SPEC as an untitled saved task without blocking New task', async (t) => {
+test('list keeps a damaged locked SPEC selectable for recovery', async (t) => {
   const f = await fixture(t);
   const created = await initRun(f);
   await unlink(path.join(f.harnessRoot, '.harness', 'runs', created.runId, 'SPEC.md'));
@@ -368,10 +380,10 @@ test('list finds a damaged locked SPEC as an untitled saved task without blockin
       if (argv[0] === 'list') return listed;
       throw new Error(`unexpected runner call: ${argv[0]}`);
     },
-    ask: async () => '1',
+    ask: async () => '2',
     write: () => {},
   });
-  assert.equal(request.type, 'start-claude-plan');
+  assert.equal(request.type, 'exit');
   assert.deepEqual(calls, [['list', '--repo', f.repo]]);
 });
 

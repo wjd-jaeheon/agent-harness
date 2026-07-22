@@ -35,24 +35,42 @@ agent status
 
 Orca에서는 Agent Permissions를 `Manual`로 두고 custom args에 `--dangerously-skip-permissions`, `--yolo`, `danger-full-access` 같은 우회 플래그가 없는지 확인한다. Orca는 화면과 터미널만 제공하며, 정본 상태는 이 저장소의 `.harness/` 파일이다.
 
-## 2. 작은 작업의 SPEC 작성
+## 2. Orca에서 `/pingpong`으로 시작
 
-[SPEC.example.md](./SPEC.example.md)를 복사해 실제 요청, `AC-###`, `CMD-###`를 적는다. 첫 파일럿은 30~90분 안에 끝낼 수 있는 작은 Git 저장소 작업을 권장한다.
+최초 1회, 이 저장소의 [Pingpong Skill](./integrations/claude/pingpong/SKILL.md)을 `C:\Users\wjdbi\.claude\skills\pingpong\SKILL.md`에 설치한다. 대상 저장소를 Orca에서 연 뒤 Claude Code 탭에 다음처럼 입력한다.
 
-## 3. Orca Global Quick Command에서 시작
+```text
+/pingpong 다운로드 파일에서 이메일·메신저 말투를 학습하는 기능
+```
+
+인수 없이 `/pingpong`만 입력하면 `무슨 작업을 계획할까요?`라고 묻는다. 요구사항이 정리되면 Skill이 SPEC을 만들고 기존 runner의 `start`를 호출한다. Cursor Scout → Claude 계획 → Codex 적대 검토 → 필요시 Claude 수정 → Codex 재검토 후 최종 계획 승인에서 멈춘다.
+
+기존 작업은 다음으로 연다.
+
+```text
+/pingpong resume
+```
+
+Orca `Settings > Shortcuts`에서 Claude Code의 `New agent tab`에 원하는 키(예: `Ctrl+Alt+H`)를 지정하면 `단축키 → /pingpong <작업>`으로 시작할 수 있다.
+
+첫 파일럿은 30~90분 안에 끝낼 수 있는 작은 Git 저장소 작업을 권장한다.
+
+## 3. 복구용 Orca Global Quick Command
+
+Claude Code를 사용할 수 없을 때 저장된 run을 복구·관리하는 선택 경로다.
 
 ```text
 Settings > Quick Commands
-Label: Harness
+Label: Pingpong Recovery
 Command: node "D:\codex-projects\agent-harness\launcher.mjs"
 Scope: Global
 ```
 
-대상 저장소의 worktree에서 Global Quick Command `Harness`를 실행한다. 현재 worktree가 runner가 만든 exact writer worktree이면 launcher는 그 소유 run만 사용한다. 같은 저장소의 활성 run이 여러 개면 자동 선택하지 않고 사람이 하나를 고른다. Orca에서 숨겨진 external writer worktree는 프로젝트 메뉴에서 숨김을 해제한 뒤 import 또는 표시한다.
+launcher는 새 작업을 만들지 않는다. 현재 worktree가 runner가 만든 exact writer worktree이면 그 소유 run만 사용한다. 같은 저장소의 활성 run이 여러 개면 자동 선택하지 않고 사람이 하나를 고른다. Orca에서 숨겨진 external writer worktree는 프로젝트 메뉴에서 숨김을 해제한 뒤 import 또는 표시한다.
 
 ## 4. Fallback: raw runner commands
 
-`Harness` first shows a choice to start a new interactive Claude plan or resume a named saved task. New task opens Claude in the selected repository with `--permission-mode plan`; it asks what to plan, makes no implementation, and waits for plan approval. This change does not automatically import that interactive plan into the Codex review loop.
+`/pingpong`을 사용할 수 없을 때만 아래 명령을 직접 사용한다. [SPEC.example.md](./SPEC.example.md)를 복사해 실제 요청, `AC-###`, `CMD-###`를 적는다.
 
 ```powershell
 Set-Location D:\codex-projects\agent-harness

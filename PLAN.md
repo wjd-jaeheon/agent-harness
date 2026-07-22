@@ -72,7 +72,8 @@ v2.0에서는 다음을 만들지 않는다.
 ### 실행 구조
 
     Orca
-    ├─ Orca Global Quick Command or /harness → launcher → runner
+    ├─ Claude Code /pingpong → runner
+    ├─ 복구용 Global Quick Command → launcher → runner
     ├─ Codex writer worktree
     ├─ Claude review pane
     └─ diff·commit 관찰
@@ -364,23 +365,25 @@ blocker/major에는 입력 또는 조건에서 잘못된 결과로 이어지는 
 
 ## 6. Orca 운영
 
-runner is the only state-transition surface. Orca and `/harness` only open the shared launcher.
+runner is the only state-transition surface. `/pingpong`은 대화형 진입 어댑터이고 launcher는 복구용 어댑터다.
 
 1. Orca에 agent-harness와 대상 저장소를 등록한다.
 2. Agent Permissions를 Manual로 둔다.
 3. custom arguments에서 bypass, yolo 계열 플래그를 제거한다.
-4. Settings > Quick Commands에 아래 Global Quick Command를 등록한다.
+4. `C:\Users\wjdbi\.claude\skills\pingpong\SKILL.md`에 개인 Skill을 설치한다. 대상 저장소의 Claude Code 탭에서 `/pingpong <작업 설명>`으로 새 작업을 시작하고 `/pingpong resume`으로 저장된 작업을 연다.
+5. Settings > Shortcuts에서 Claude Code의 `New agent tab`에 원하는 단축키를 배정한다.
+6. Claude가 없을 때를 위한 복구용 Global Quick Command는 선택적으로 등록한다.
 
    ```text
    Settings > Quick Commands
-   Label: Harness
+   Label: Pingpong Recovery
    Command: node "D:\codex-projects\agent-harness\launcher.mjs"
    Scope: Global
    ```
 
-5. 대상 저장소의 worktree에서 `Harness`를 실행한다. launcher가 exact writer worktree이면 그 소유 run만 선택하고, 같은 저장소의 활성 run이 여러 개면 반드시 사람이 하나를 선택한다.
-6. Codex writer worktree, Claude review pane, diff viewer를 같은 run 단위로 연다. Orca에서 숨겨진 external writer worktree는 프로젝트 메뉴에서 숨김을 해제한 뒤 import 또는 표시한다.
-7. 사람 승인과 resolve는 launcher가 호출하는 공개 runner 명령으로만 상태를 바꾼다.
+7. launcher는 새 작업을 만들지 않는다. exact writer worktree이면 그 소유 run만 선택하고, 같은 저장소의 활성 run이 여러 개면 반드시 사람이 하나를 선택한다.
+8. Codex writer worktree, Claude review pane, diff viewer를 같은 run 단위로 연다. Orca에서 숨겨진 external writer worktree는 프로젝트 메뉴에서 숨김을 해제한 뒤 import 또는 표시한다.
+9. Skill과 launcher는 공개 runner 명령만 호출하며 `.harness` 상태를 직접 수정하지 않는다.
 
 v2.0은 Orca orchestration을 사용하지 않는다. Orca는 조작·관찰 화면이며 runner 상태의 정본이 아니다. Orca 종료 후 다시 열어 status와 run만 실행하면 이어져야 한다.
 
@@ -402,7 +405,7 @@ v2.0은 Orca orchestration을 사용하지 않는다. Orca는 조작·관찰 화
 | complete --run <run-id> --merged-sha <sha> | 사람 머지 뒤 DONE 기록 |
 | abort --run <run-id> --reason <text> | 현재 run 보존 종료 |
 
-The Global Quick Command and optional `/harness` Skill are entrypoints to the same launcher; the runner remains the only state-transition surface.
+`/pingpong`은 새 작업의 기본 진입점이고 Global Quick Command는 저장 작업 복구용이다. 둘 다 runner 밖의 상태 전이를 구현하지 않는다.
 
 ## 8. 구독 인증과 CLI 경계
 
