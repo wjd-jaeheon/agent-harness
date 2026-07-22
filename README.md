@@ -3,6 +3,8 @@
 현재 구현 범위는 **계획 핑퐁**이다.
 
 ```text
+Claude 요구사항 확인
+→ 사람의 최종 SPEC·핑퐁 시작 승인
 Cursor Scout 1회
 → Claude 계획
 → Codex 적대 리뷰
@@ -43,7 +45,7 @@ Orca에서는 Agent Permissions를 `Manual`로 두고 custom args에 `--dangerou
 /pingpong 다운로드 파일에서 이메일·메신저 말투를 학습하는 기능
 ```
 
-인수 없이 `/pingpong`만 입력하면 `무슨 작업을 계획할까요?`라고 묻는다. 요구사항이 정리되면 Skill이 SPEC을 만들고 기존 runner의 `start`를 호출한다. Cursor Scout → Claude 계획 → Codex 적대 검토 → 필요시 Claude 수정 → Codex 재검토 후 최종 계획 승인에서 멈춘다.
+인수 없이 `/pingpong`만 입력하면 `무슨 작업을 계획할까요?`라고 묻는다. 요구사항이 정리되면 Skill이 목표·제외 범위·완료 기준·검증 명령을 최종 SPEC 요약으로 보여준다. 사용자가 승인해야만 기존 runner의 `start`를 호출한다. 이후 Cursor Scout → Claude 계획 → Codex 적대 검토 → 필요시 Claude 수정 → Codex 재검토 후 최종 계획 승인에서 멈춘다.
 
 기존 작업은 다음으로 연다.
 

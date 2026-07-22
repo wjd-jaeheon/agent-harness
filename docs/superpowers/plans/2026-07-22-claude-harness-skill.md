@@ -29,7 +29,7 @@
 - Install: `C:/Users/wjdbi/.claude/skills/pingpong/SKILL.md`
 
 **Interfaces:**
-- `/pingpong [작업 설명]` collects requirements, creates a temporary SPEC, and invokes `harness.mjs start`.
+- `/pingpong [작업 설명]` collects requirements, gets explicit approval on the final SPEC summary, then creates a temporary SPEC and invokes `harness.mjs start`.
 - `/pingpong resume` opens the existing launcher for explicit saved-run recovery.
 - `launch()` never starts an untracked interactive Claude plan.
 

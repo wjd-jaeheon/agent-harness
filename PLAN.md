@@ -23,7 +23,7 @@ v2.0의 구조는 다음으로 고정한다.
 
 - Codex만 source를 수정한다. Claude와 Cursor는 계획·review·Scout 산출물만 작성한다.
 - runner가 루프와 상태를 소유한다. 모델이 다음 단계를 선택하지 않는다.
-- 사람 승인 게이트는 계획 승인과 GitHub 머지 두 번이다.
+- 사람 확인은 핑퐁 시작 전 SPEC 승인, 최종 계획 승인, GitHub 머지 세 번이다. SPEC 승인은 run 생성 전 대화 게이트이고 나머지 둘만 runner 상태 게이트다.
 - Orca가 종료돼도 파일 원장으로 재개할 수 있다.
 - v1.9는 docs/full-spec-v1.9.md에 방어 후보 카탈로그로 보존한다.
 
@@ -195,7 +195,7 @@ Codex 구현 결과의 diff가 비어 있어도 runner는 완료 선언을 믿�
 
 ### A. 계획 루프
 
-1. 사람이 Orca Control terminal에서 init을 실행해 SPEC과 exact base SHA를 잠근다.
+1. `/pingpong` Skill이 최종 SPEC 요약을 보여주고 사람의 명시적 승인을 받은 뒤에만 `start`를 호출해 SPEC과 exact base SHA를 잠근다.
 2. runner가 Cursor Repo Scout를 exact base SHA에서 read-only로 1회 실행하고 원문을 `reviews/cursor-scout.md`에 저장한다.
 3. Scout를 사용할 수 없으면 사유를 기록하고 계획을 계속한다. 자동 재시도하지 않는다.
 4. runner가 Claude에 SPEC과 Scout 원문을 전달해 PLAN_v1.md를 만든다. Claude는 각 항목을 `SCOUT-###: incorporated | rejected — <근거 또는 PLAN 위치>`로 처리한다.
@@ -457,5 +457,5 @@ full-spec-v1.9.md의 항목은 다음 형식으로만 승격한다.
 - 계획은 Claude → Codex review → Claude revise → Codex re-review로 수렴한다.
 - 구현은 Codex checkpoint → Claude review → Codex fix로 수렴한다.
 - 최종은 Claude full review → Codex decision/fix → Claude close-out review다.
-- 사람은 계획 승인과 GitHub 머지를 담당한다.
+- 사람은 핑퐁 시작 전 SPEC 확인, 최종 계획 승인, GitHub 머지를 담당한다.
 - v1.9의 자동 merge, 강한 sandbox, schema codegen, 해시체인은 보존만 하고 v2.0에서 구현하지 않는다.

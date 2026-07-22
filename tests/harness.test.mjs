@@ -140,6 +140,7 @@ test('tracked pingpong skill connects a task to the public plan runner', async (
     new URL('../integrations/claude/pingpong/SKILL.md', import.meta.url),
     'utf8',
   );
+  const newWork = skill.split('## 새 작업 시작')[1];
   assert.match(skill, /^name: pingpong$/m);
   assert.match(skill, /^disable-model-invocation: true$/m);
   assert.match(skill, /\$ARGUMENTS/);
@@ -150,8 +151,15 @@ test('tracked pingpong skill connects a task to the public plan runner', async (
   assert.match(skill, /\$env:TEMP/);
   assert.doesNotMatch(skill, /\.harness\/inputs/);
   assert.match(skill, /\.harness\/runs\/<runId>\/<currentPlanPath>/);
+  assert.match(skill, /최종 SPEC 요약/);
+  assert.match(skill, /명시적 승인.*전에는.*harness\.mjs.*start/s);
+  assert.match(skill, /명시적 승인.*전에는.*Cursor Scout.*provider.*subagent.*호출하지 않는다/s);
+  assert.match(skill, /최종 SPEC 요약.*명시적 승인.*승인 뒤.*harness\.mjs.*start/s);
+  assert.match(skill, /수정.*SPEC.*다시.*승인/s);
   assert.match(skill, /runner.*상태 전이/s);
-  assert.doesNotMatch(skill.split('## 새 작업 시작')[1], /launcher\.mjs/);
+  assert.match(newWork, /새 작업 진입 시점부터.*명시적 승인.*Cursor Scout.*provider.*subagent.*호출하지 않는다/s);
+  assert.ok(newWork.indexOf('새 작업 진입 시점부터') < newWork.indexOf('1. 현재 Git root'));
+  assert.doesNotMatch(newWork, /launcher\.mjs/);
 });
 
 test('launcher has no disconnected new-task path', async () => {
