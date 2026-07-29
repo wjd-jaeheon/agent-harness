@@ -1,6 +1,6 @@
-# agent-harness — Phase 1 quick start
+# agent-harness — minimal Phase 2 quick start
 
-현재 구현 범위는 **계획 핑퐁**이다.
+현재 구현 범위는 **계획 핑퐁 → Codex 구현 → runner 검증 → 수동 병합 준비**다.
 
 ```text
 Claude 요구사항 확인
@@ -11,12 +11,12 @@ Cursor Scout 1회
 → 필요하면 Claude 수정
 → Codex 재검토
 → 사람의 계획 승인
-→ IMPLEMENT_LOOP에서 정지
+→ Codex 구현
+→ runner diff·보호 경로·CMD 검증
+→ READY_FOR_MANUAL_MERGE
 ```
 
-Phase 1 currently stops after `IMPLEMENT_LOOP`; it does not implement the target repository's source code.
-
-Phase 1은 대상 저장소의 소스 코드를 수정하지 않는다. 실제 Codex 구현과 Claude 코드 리뷰 루프는 다음 단계에서 붙인다.
+Codex만 detached writer worktree의 source를 수정한다. runner는 `.git`, `.harness` 변경을 거부하고 잠긴 SPEC의 backtick-wrapped `CMD-###`를 실행한다.
 
 ## 1. 최초 1회 확인
 
@@ -90,9 +90,10 @@ node .\harness.mjs run --run $run
 node .\harness.mjs status --run $run
 ```
 
-`run`은 필요한 계획 라운드를 한 번에 실행하고 다음 중 하나에서 멈춘다.
+`run`은 현재 상태의 자동 단계를 실행하고 다음 중 하나에서 멈춘다.
 
 - `AWAIT_PLAN_APPROVAL`: 계획 검토 가능
+- `READY_FOR_MANUAL_MERGE`: 구현 diff와 필수 검증 통과
 - `NEEDS_HUMAN`: 예산 소진 또는 경계 위반. `lastError` 확인
 
 ## 5. 계획 읽고 결정
@@ -105,6 +106,9 @@ node .\harness.mjs status --run $run
   plan/
   reviews/
   decisions/
+  evidence/
+  implementation.diff
+  implementation-manifest.json
   run.json
   events.jsonl
 ```
@@ -113,7 +117,10 @@ node .\harness.mjs status --run $run
 
 ```powershell
 node .\harness.mjs approve-plan --run $run --plan-sha '<currentPlanSha>'
+node .\harness.mjs run --run $run
 ```
+
+승인된 구현은 source를 commit하지 않는다. `READY_FOR_MANUAL_MERGE`에서 `changedPaths`, `implementationDigest`, `verificationEvidence`와 writer worktree diff를 사람이 확인한다.
 
 보완이 필요하면 메모 파일을 만든 뒤 한 번 더 핑퐁한다.
 
@@ -131,6 +138,15 @@ node .\harness.mjs run --run $run
 node .\harness.mjs abort --run $run --reason 'scope changed'
 ```
 
+중단한 run의 최신 계획을 수정된 SPEC의 시작점으로 이어받으려면 명시적으로 parent를 지정한다. 동일 입력으로 예산만 초기화하는 재시작은 거부되고, 계보 전체 리뷰는 기본 6회에서 멈춘다.
+
+```powershell
+node .\harness.mjs start `
+  --repo "D:\path\to\target-repo" `
+  --spec "D:\path\to\revised-SPEC.md" `
+  --parent-run $run
+```
+
 ## 6. 재부팅 뒤 재개
 
 같은 명령만 다시 실행한다. 이미 완료된 Scout·계획·리뷰는 다시 호출하지 않고, 중단된 read-only 단계만 허용된 범위에서 복구한다.
@@ -144,7 +160,8 @@ node .\harness.mjs run --run $run
 
 ## 현재 한계
 
-- `IMPLEMENT_LOOP` 이후는 아직 구현되지 않았다.
+- checkpoint별 Claude 코드 리뷰·Codex fix 루프는 아직 없다.
+- verification command는 SPEC에서 `CMD-001: \`실행할 명령\`` 형식이어야 한다.
 - GitHub 자동 병합은 없다. 최종 병합은 사람이 한다.
 - Orca orchestration은 쓰지 않는다.
-- Cursor 독립 감사와 구현 루프는 Phase 2에서 추가한다.
+- Cursor 독립 감사는 아직 없다.

@@ -2,7 +2,7 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "phase": { "const": "plan" },
+    "phase": { "type": "string", "const": "plan" },
     "round": { "type": "integer", "minimum": 1 },
     "findings": {
       "type": "array",
@@ -11,7 +11,7 @@
         "additionalProperties": false,
         "properties": {
           "id": { "type": "string", "minLength": 1 },
-          "severity": { "enum": ["blocker", "major", "minor"] },
+          "severity": { "type": "string", "enum": ["blocker", "major", "minor"] },
           "claim": { "type": "string" },
           "failure_scenario": { "type": "string" },
           "evidence": { "type": "array", "items": { "type": "string" } },
@@ -27,7 +27,7 @@
         "additionalProperties": false,
         "properties": {
           "id": { "type": "string", "minLength": 1 },
-          "status": { "enum": ["resolved", "open"] }
+          "status": { "type": "string", "enum": ["resolved", "open"] }
         },
         "required": ["id", "status"]
       }
@@ -39,7 +39,7 @@
         "additionalProperties": false,
         "properties": {
           "id": { "type": "string", "pattern": "^AC-[0-9]{3}$" },
-          "status": { "enum": ["pass", "fail", "needs_evidence"] },
+          "status": { "type": "string", "enum": ["pass", "fail", "needs_evidence"] },
           "implementation_ref": { "type": "string" },
           "verification_ref": { "type": "string" }
         },

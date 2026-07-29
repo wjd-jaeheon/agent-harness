@@ -2,10 +2,12 @@ import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   appendFile,
+  lstat,
   mkdir,
   mkdtemp,
   readdir,
   readFile,
+  readlink,
   rename,
   rm,
   stat,
@@ -21,13 +23,18 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const TERMINAL_STATES = new Set([
   'AWAIT_PLAN_APPROVAL',
   'NEEDS_HUMAN',
-  'IMPLEMENT_LOOP',
+  'READY_FOR_MANUAL_MERGE',
   'ABORTED',
   'DONE',
 ]);
 const CLOSED_RUN_STATES = new Set(['ABORTED', 'DONE']);
 const DEFAULT_POLICY = {
-  budgets: { plan_review_max: 2, human_plan_revision_max: 1 },
+  budgets: {
+    plan_review_max: 2,
+    human_plan_revision_max: 1,
+    lineage_plan_review_max: 6,
+  },
+  protected_paths: ['.git', '.harness'],
 };
 const REVISER_SCHEMA = {
   type: 'object',
@@ -138,6 +145,7 @@ export function createDefaultProviderRunner({
   env = process.env,
   processRunner = runProcess,
   commands = {},
+  platform = process.platform,
 } = {}) {
   const resolvedCommands = {
     claude: commands.claude ?? 'claude',
@@ -174,8 +182,8 @@ export function createDefaultProviderRunner({
           'text',
           '--mode',
           'plan',
-          '--sandbox',
-          'enabled',
+          // cursor-agent sandbox requires macOS/Linux; on Windows rely on plan mode + allowlist defaults
+          ...(platform === 'win32' ? [] : ['--sandbox', 'enabled']),
           '--workspace',
           request.cwd,
           '--trust',
@@ -229,6 +237,25 @@ export function createDefaultProviderRunner({
     if (request.provider === 'codex') {
       if (env.OPENAI_API_KEY?.trim() || env.CODEX_API_KEY?.trim()) {
         throw new Error('OPENAI_API_KEY/CODEX_API_KEY is forbidden; use ChatGPT subscription login');
+      }
+      if (request.step === 'codex_implement') {
+        const input = await prompt('implementer.md', request.inputs);
+        return processRunner({
+          command: resolvedCommands.codex,
+          args: [
+            'exec',
+            '--sandbox',
+            'workspace-write',
+            '--json',
+            '--ephemeral',
+            '--color',
+            'never',
+            '-',
+          ],
+          cwd: request.cwd,
+          input,
+          env,
+        });
       }
       const input = await prompt('plan-reviewer.md', { ...request.inputs, round: request.round });
       const temporary = await mkdtemp(path.join(tmpdir(), 'agent-harness-codex-'));
@@ -322,6 +349,73 @@ function runFile(harnessRoot, runId) {
   return path.join(runRoot(harnessRoot, runId), 'run.json');
 }
 
+function validRunId(runId) {
+  return /^\d{14}-[0-9a-f]{8}$/.test(runId);
+}
+
+function processIsRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code !== 'ESRCH';
+  }
+}
+
+async function retireRunLock(lock) {
+  const stale = `${lock}.stale.${process.pid}.${randomUUID()}`;
+  try {
+    await rename(lock, stale);
+    await rm(stale, { recursive: true, force: true });
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+}
+
+async function withRunLock(harnessRoot, runId, callback) {
+  if (!validRunId(runId)) throw new Error('run ID is invalid');
+  const lock = path.join(runRoot(harnessRoot, runId), '.runner-lock');
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await mkdir(lock);
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      let owner;
+      try {
+        owner = JSON.parse(await readFile(path.join(lock, 'owner.json'), 'utf8'));
+      } catch {
+        let lockInfo;
+        try {
+          lockInfo = await stat(lock);
+        } catch (statError) {
+          if (statError.code === 'ENOENT') continue;
+          throw statError;
+        }
+        if (Date.now() - lockInfo.mtimeMs < 5_000) {
+          throw new Error('run is already executing');
+        }
+        await retireRunLock(lock);
+        continue;
+      }
+      if (!Number.isInteger(owner.pid) || processIsRunning(owner.pid)) {
+        throw new Error(`run is already executing${owner.pid ? ` in PID ${owner.pid}` : ''}`);
+      }
+      await retireRunLock(lock);
+      continue;
+    }
+    try {
+      await atomicJson(path.join(lock, 'owner.json'), {
+        pid: process.pid,
+        started_at: new Date().toISOString(),
+      });
+      return await callback();
+    } finally {
+      await rm(lock, { recursive: true, force: true });
+    }
+  }
+  throw new Error('could not acquire run execution lock');
+}
+
 async function loadRun(harnessRoot, runId) {
   return JSON.parse(await readFile(runFile(harnessRoot, runId), 'utf8'));
 }
@@ -354,14 +448,18 @@ async function setState(harnessRoot, run, state, action, result) {
   await event(harnessRoot, run, action, result, previous);
 }
 
-async function gitOutput(gitExecutable, cwd, args) {
+async function gitRawOutput(gitExecutable, cwd, args) {
   const { stdout } = await exec(gitExecutable, args, {
     cwd,
     encoding: 'utf8',
     windowsHide: true,
     maxBuffer: 4 * 1024 * 1024,
   });
-  return stdout.trim();
+  return stdout;
+}
+
+async function gitOutput(gitExecutable, cwd, args) {
+  return (await gitRawOutput(gitExecutable, cwd, args)).trim();
 }
 
 function pathKey(value) {
@@ -380,7 +478,7 @@ async function gitContext(repo, gitExecutable) {
 
 async function gitSnapshot(run, gitExecutable) {
   const head = await gitOutput(gitExecutable, run.worktree_path, ['rev-parse', 'HEAD']);
-  const status = await gitOutput(gitExecutable, run.worktree_path, [
+  const status = await gitRawOutput(gitExecutable, run.worktree_path, [
     'status',
     '--porcelain=v1',
     '-z',
@@ -406,7 +504,7 @@ function parseScout(text) {
   const pattern = /^SCOUT-(\d{3})\s*\|\s*(reuse|impact|test|risk|unknown)\s*\r?\nevidence:\s*(.+)\r?\nnote:\s*(.+)$/;
   const items = [];
   for (const [index, block] of blocks.entries()) {
-    const match = block.match(pattern);
+    const match = block.trim().match(pattern);
     if (!match) throw new Error('Scout output has invalid format or surrounding prose');
     const expected = String(index + 1).padStart(3, '0');
     if (match[1] !== expected) throw new Error('Scout IDs must be sequential from SCOUT-001');
@@ -551,7 +649,206 @@ async function readPolicy(harnessRoot) {
       ...DEFAULT_POLICY.budgets,
       ...parsed.budgets,
     },
+    protected_paths: parsed.protected_paths ?? DEFAULT_POLICY.protected_paths,
   };
+}
+
+function parseVerificationCommands(specText, expectedIds) {
+  const commands = new Map();
+  const pattern = /^\s*(?:-\s*)?(CMD-\d{3}):\s*`([^`\r\n]+)`\s*$/gm;
+  for (const match of specText.matchAll(pattern)) {
+    if (commands.has(match[1])) throw new Error(`duplicate verification command: ${match[1]}`);
+    commands.set(match[1], match[2]);
+  }
+  for (const id of expectedIds) {
+    if (!commands.has(id)) throw new Error(`${id} needs one backtick-wrapped executable command`);
+  }
+  return expectedIds.map((id) => ({ id, command: commands.get(id) }));
+}
+
+function normalizeProtectedPaths(values) {
+  if (!Array.isArray(values) || values.length === 0) {
+    throw new Error('policy.protected_paths must be a non-empty array');
+  }
+  return values.map((value) => {
+    if (typeof value !== 'string') throw new Error('policy.protected_paths entries must be strings');
+    const normalized = value.replaceAll('\\', '/').replace(/^\.\/+/, '').replace(/\/+$/, '');
+    if (
+      !normalized ||
+      path.posix.isAbsolute(normalized) ||
+      path.win32.isAbsolute(value) ||
+      normalized.split('/').includes('..')
+    ) {
+      throw new Error(`invalid protected path: ${value}`);
+    }
+    return normalized;
+  });
+}
+
+async function filesystemEntries(absolute, relative = '') {
+  try {
+    const info = await lstat(absolute);
+    if (info.isSymbolicLink()) {
+      return [{ path: relative, type: 'symlink', value: await readlink(absolute) }];
+    }
+    if (info.isFile()) {
+      return [{ path: relative, type: 'file', value: sha256Bytes(await readFile(absolute)) }];
+    }
+    if (!info.isDirectory()) return [{ path: relative, type: 'other', value: null }];
+    const entries = [{ path: relative, type: 'directory', value: null }];
+    for (const name of (await readdir(absolute)).sort()) {
+      entries.push(...await filesystemEntries(path.join(absolute, name), `${relative}/${name}`));
+    }
+    return entries;
+  } catch (error) {
+    if (error.code === 'ENOENT') return [{ path: relative, type: 'missing', value: null }];
+    throw error;
+  }
+}
+
+async function protectedPathDigests(worktree, protectedPaths) {
+  const digests = {};
+  for (const relative of protectedPaths) {
+    const entries = await filesystemEntries(path.resolve(worktree, ...relative.split('/')), relative);
+    digests[relative] = sha256Bytes(Buffer.from(JSON.stringify(entries)));
+  }
+  return digests;
+}
+
+async function implementationPaths(run, gitExecutable) {
+  const tracked = await gitRawOutput(gitExecutable, run.worktree_path, [
+    'diff',
+    '--name-only',
+    '-z',
+    'HEAD',
+    '--',
+  ]);
+  const untracked = await gitRawOutput(gitExecutable, run.worktree_path, [
+    'ls-files',
+    '--others',
+    '--exclude-standard',
+    '-z',
+  ]);
+  const untrackedPaths = untracked.split('\0').filter(Boolean);
+  const paths = [...new Set([...tracked.split('\0').filter(Boolean), ...untrackedPaths])]
+    .map((value) => value.replaceAll('\\', '/'))
+    .sort();
+  return {
+    paths,
+    untracked: new Set(untrackedPaths.map((value) => value.replaceAll('\\', '/'))),
+  };
+}
+
+async function stagedPaths(run, gitExecutable) {
+  return (await gitRawOutput(gitExecutable, run.worktree_path, [
+    'diff',
+    '--cached',
+    '--name-only',
+    '-z',
+    '--',
+  ])).split('\0').filter(Boolean);
+}
+
+async function implementationDiff(run, gitExecutable, paths, untracked) {
+  let diff = await gitRawOutput(gitExecutable, run.worktree_path, [
+    'diff',
+    '--binary',
+    'HEAD',
+    '--',
+  ]);
+  for (const relative of paths) {
+    if (!untracked.has(relative)) continue;
+    try {
+      diff += await gitRawOutput(gitExecutable, run.worktree_path, [
+        'diff',
+        '--no-index',
+        '--binary',
+        '--',
+        '/dev/null',
+        relative,
+      ]);
+    } catch (error) {
+      if (error.code !== 1 || typeof error.stdout !== 'string') throw error;
+      diff += error.stdout;
+    }
+  }
+  return diff;
+}
+
+async function implementationManifest(run, paths) {
+  const root = path.resolve(run.worktree_path);
+  const prefix = `${root}${path.sep}`;
+  const manifest = [];
+  for (const relative of paths) {
+    const absolute = path.resolve(root, ...relative.split('/'));
+    if (absolute !== root && !absolute.startsWith(prefix)) {
+      throw new Error(`changed path escapes worktree: ${relative}`);
+    }
+    try {
+      const info = await lstat(absolute);
+      if (info.isSymbolicLink()) {
+        manifest.push({
+          path: relative,
+          type: 'symlink',
+          mode: info.mode & 0o777,
+          sha256: sha256Bytes(Buffer.from(await readlink(absolute))),
+        });
+      } else if (info.isFile()) {
+        manifest.push({
+          path: relative,
+          type: 'file',
+          mode: info.mode & 0o777,
+          sha256: sha256Bytes(await readFile(absolute)),
+        });
+      } else {
+        throw new Error(`unsupported changed path type: ${relative}`);
+      }
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        manifest.push({ path: relative, type: 'deleted', mode: null, sha256: null });
+      }
+      else throw error;
+    }
+  }
+  return manifest;
+}
+
+function verificationRequest(command, cwd, platform) {
+  if (platform === 'win32') {
+    return {
+      command: 'powershell.exe',
+      args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command],
+      cwd,
+    };
+  }
+  return { command: '/bin/sh', args: ['-lc', command], cwd };
+}
+
+function verificationLog({
+  id,
+  command,
+  cwd,
+  result,
+  startedAt,
+  finishedAt,
+  headSha,
+  inspectionError = '',
+}) {
+  return [
+    `command_id: ${id}`,
+    `command: ${command}`,
+    `cwd: ${cwd}`,
+    `exit_code: ${result.exitCode}`,
+    `head_sha: ${headSha}`,
+    `started_at: ${startedAt}`,
+    `finished_at: ${finishedAt}`,
+    `inspection_error: ${inspectionError}`,
+    'stdout:',
+    result.stdout ?? '',
+    'stderr:',
+    result.stderr ?? '',
+    '',
+  ].join('\n');
 }
 
 async function stopForLockedInput(harnessRoot, run, label, detail) {
@@ -575,6 +872,15 @@ async function verifyLockedFile(harnessRoot, run, relative, expectedSha, label) 
 
 async function verifyLockedInputs(harnessRoot, run) {
   if (!(await verifyLockedFile(harnessRoot, run, 'SPEC.md', run.spec.sha256, 'SPEC'))) return false;
+  if (run.baseline) {
+    for (const [label, file, sha] of [
+      ['baseline PLAN', run.baseline.plan_path, run.baseline.plan_sha256],
+      ['baseline review', run.baseline.review_path, run.baseline.review_sha256],
+      ['baseline SPEC', run.baseline.spec_path, run.baseline.spec_sha256],
+    ]) {
+      if (!(await verifyLockedFile(harnessRoot, run, file, sha, label))) return false;
+    }
+  }
   if (
     run.cursor.scout_status === 'completed' &&
     !(await verifyLockedFile(
@@ -608,9 +914,58 @@ async function initCommand(values, options) {
   const specBytes = await readFile(specPath);
   const specText = specBytes.toString('utf8');
   const spec = validateSpec(specText);
+  const specSha = sha256Bytes(specBytes);
   const baseSha = await gitOutput(options.gitExecutable, repo, ['rev-parse', 'HEAD']);
   const inside = await gitOutput(options.gitExecutable, repo, ['rev-parse', '--is-inside-work-tree']);
   if (inside !== 'true') throw new Error('repo must be a Git worktree');
+
+  let carryover = null;
+  if (values.parent_run) {
+    const parent = await loadRun(options.harnessRoot, values.parent_run);
+    if (parent.state !== 'ABORTED') throw new Error('parent run must be ABORTED');
+    if (pathKey(parent.repo_path) !== pathKey(repo)) {
+      throw new Error('parent run must belong to the same repository');
+    }
+    if (!parent.current_plan_path || !parent.current_review_path) {
+      throw new Error('parent run has no reviewed plan to carry over');
+    }
+    if (parent.base_sha === baseSha && parent.spec?.sha256 === specSha) {
+      throw new Error('parent run inputs are unchanged; resume or inspect the parent instead');
+    }
+    const priorPlanReviewRounds =
+      (parent.prior_plan_review_rounds ?? 0) + (parent.plan_review_round ?? 0);
+    const policy = await readPolicy(options.harnessRoot);
+    if (priorPlanReviewRounds >= policy.budgets.lineage_plan_review_max) {
+      throw new Error('lineage plan review budget exhausted');
+    }
+    const parentRoot = runRoot(options.harnessRoot, parent.run_id);
+    carryover = {
+      parent,
+      priorPlanReviewRounds,
+      plan: await readFile(path.join(parentRoot, parent.current_plan_path)),
+      review: await readFile(path.join(parentRoot, parent.current_review_path)),
+      spec: await readFile(path.join(parentRoot, 'SPEC.md')),
+    };
+  }
+
+  const runsDirectory = path.join(options.harnessRoot, '.harness', 'runs');
+  let existingRunIds = [];
+  try {
+    existingRunIds = await readdir(runsDirectory);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  for (const existingRunId of existingRunIds) {
+    const existing = await loadRun(options.harnessRoot, existingRunId);
+    if (
+      !CLOSED_RUN_STATES.has(existing.state) &&
+      pathKey(existing.repo_path) === pathKey(repo) &&
+      existing.base_sha === baseSha &&
+      existing.spec?.sha256 === specSha
+    ) {
+      throw new Error(`matching active run exists: ${existing.run_id}; resume it`);
+    }
+  }
 
   const runId = newRunId();
   const root = runRoot(options.harnessRoot, runId);
@@ -622,9 +977,30 @@ async function initCommand(values, options) {
   if (status !== '') throw new Error('new writer worktree is not clean');
 
   await atomicWrite(path.join(root, 'SPEC.md'), specBytes);
+  let baseline = null;
+  if (carryover) {
+    const planPath = 'baseline/PLAN.md';
+    const reviewPath = 'baseline/review.json';
+    const baselineSpecPath = 'baseline/SPEC.md';
+    await atomicWrite(path.join(root, planPath), carryover.plan);
+    await atomicWrite(path.join(root, reviewPath), carryover.review);
+    await atomicWrite(path.join(root, baselineSpecPath), carryover.spec);
+    baseline = {
+      plan_path: planPath,
+      plan_sha256: sha256Bytes(carryover.plan),
+      review_path: reviewPath,
+      review_sha256: sha256Bytes(carryover.review),
+      spec_path: baselineSpecPath,
+      spec_sha256: sha256Bytes(carryover.spec),
+      base_sha: carryover.parent.base_sha,
+    };
+  }
   await atomicWrite(path.join(root, 'events.jsonl'), '');
   const run = {
     run_id: runId,
+    parent_run_id: carryover?.parent.run_id ?? null,
+    prior_plan_review_rounds: carryover?.priorPlanReviewRounds ?? 0,
+    baseline,
     state: 'PLAN_LOOP',
     repo_path: repo,
     worktree_path: worktree,
@@ -633,7 +1009,7 @@ async function initCommand(values, options) {
     spec: {
       acceptance_ids: spec.acceptanceIds,
       command_ids: spec.commandIds,
-      sha256: sha256Bytes(specBytes),
+      sha256: specSha,
     },
     plan_version: 0,
     plan_review_round: 0,
@@ -659,6 +1035,7 @@ async function initCommand(values, options) {
     approved_plan_path: null,
     approved_plan_sha: null,
     approved_base_sha: null,
+    implementation: null,
   };
   await saveRun(options.harnessRoot, run);
   await event(options.harnessRoot, run, 'init', 'created');
@@ -669,12 +1046,20 @@ function summarize(run) {
   return {
     runId: run.run_id,
     state: run.state,
+    worktreePath: run.worktree_path,
     planVersion: run.plan_version,
     planReviewRound: run.plan_review_round,
     humanPlanRevisionCount: run.human_plan_revision_count ?? 0,
     currentPlanPath: run.current_plan_path,
     currentPlanSha: run.current_plan_sha,
+    parentRunId: run.parent_run_id ?? null,
+    lineagePlanReviewRounds:
+      (run.prior_plan_review_rounds ?? 0) + (run.plan_review_round ?? 0),
     cursorScoutStatus: run.cursor.scout_status,
+    cursorScoutUnavailableReason: run.cursor.unavailable_reason,
+    changedPaths: run.implementation?.changed_paths ?? [],
+    implementationDigest: run.implementation?.digest ?? null,
+    verificationEvidence: run.implementation?.evidence_paths ?? [],
     lastError: run.last_error,
   };
 }
@@ -928,6 +1313,7 @@ async function callScout(harnessRoot, run, providerRunner, gitExecutable) {
   run.cursor.scout_attempted = 1;
   const step = await beginStep(harnessRoot, run, 'cursor_scout', 1, inputs, gitExecutable);
   if (!step) return;
+  await event(harnessRoot, run, 'cursor_scout_start', `attempt ${step.attempt}`);
   let result;
   try {
     result = await providerRunner({
@@ -954,11 +1340,14 @@ async function callScout(harnessRoot, run, providerRunner, gitExecutable) {
     run.cursor.scout_path = step.outputs.artifact;
     run.cursor.scout_sha256 = sha256Bytes(Buffer.from(result.scout));
     run.cursor.scout_ids = items.map((item) => item.id);
+    await finishStep(harnessRoot, run);
+    await event(harnessRoot, run, 'cursor_scout_completed', `${items.length} items`);
   } catch (error) {
     run.cursor.scout_status = 'unavailable';
     run.cursor.unavailable_reason = error.message;
+    await finishStep(harnessRoot, run);
+    await event(harnessRoot, run, 'cursor_scout_unavailable', error.message);
   }
-  await finishStep(harnessRoot, run);
 }
 
 async function callPlanner(harnessRoot, run, providerRunner, gitExecutable) {
@@ -967,11 +1356,24 @@ async function callPlanner(harnessRoot, run, providerRunner, gitExecutable) {
   const scoutText = run.cursor.scout_path
     ? await readFile(path.join(root, run.cursor.scout_path), 'utf8')
     : '';
+  const baselinePlan = run.baseline
+    ? await readFile(path.join(root, run.baseline.plan_path), 'utf8')
+    : '';
+  const baselineReview = run.baseline
+    ? JSON.parse(await readFile(path.join(root, run.baseline.review_path), 'utf8'))
+    : null;
+  const baselineSpec = run.baseline
+    ? await readFile(path.join(root, run.baseline.spec_path), 'utf8')
+    : '';
   const inputs = {
     spec: specText,
     scout: scoutText,
     scout_status: run.cursor.scout_status,
     scout_sha256: run.cursor.scout_sha256,
+    baseline_plan: baselinePlan,
+    baseline_review: baselineReview,
+    baseline_spec: baselineSpec,
+    baseline_base_sha: run.baseline?.base_sha ?? null,
   };
   const step = await beginStep(harnessRoot, run, 'claude_plan', 1, inputs, gitExecutable);
   if (!step) return;
@@ -1011,12 +1413,19 @@ async function callReviewer(harnessRoot, run, providerRunner, gitExecutable) {
   const round = run.plan_review_round + 1;
   const specText = await readFile(path.join(root, 'SPEC.md'), 'utf8');
   const planText = await readFile(path.join(root, run.current_plan_path), 'utf8');
+  const previousPlan = run.plan_version > 1
+    ? await readFile(path.join(root, `plan/PLAN_v${run.plan_version - 1}.md`), 'utf8')
+    : run.baseline
+      ? await readFile(path.join(root, run.baseline.plan_path), 'utf8')
+      : '';
   const scoutText = run.cursor.scout_path
     ? await readFile(path.join(root, run.cursor.scout_path), 'utf8')
     : '';
   const previousReview = run.current_review_path
     ? JSON.parse(await readFile(path.join(root, run.current_review_path), 'utf8'))
-    : null;
+    : run.baseline
+      ? JSON.parse(await readFile(path.join(root, run.baseline.review_path), 'utf8'))
+      : null;
   const previousDecisionPath = run.plan_review_round > 0
     ? path.join(root, `decisions/plan-r${run.plan_review_round}.md`)
     : null;
@@ -1026,6 +1435,8 @@ async function callReviewer(harnessRoot, run, providerRunner, gitExecutable) {
   const inputs = {
     spec: specText,
     plan: planText,
+    previous_plan: previousPlan,
+    review_scope: previousPlan ? 'delta' : 'full',
     scout: scoutText,
     scout_sha256: run.cursor.scout_sha256,
     previous_gate_blocking_ids: run.previous_gate_blocking_ids,
@@ -1171,6 +1582,14 @@ async function runPlanLoop(run, options) {
       continue;
     }
     if (run.last_reviewed_plan_sha !== run.current_plan_sha) {
+      if (
+        (run.prior_plan_review_rounds ?? 0) + run.plan_review_round
+        >= policy.budgets.lineage_plan_review_max
+      ) {
+        run.last_error = 'lineage plan review budget exhausted';
+        await setState(harnessRoot, run, 'NEEDS_HUMAN', 'plan_gate', run.last_error);
+        break;
+      }
       await callReviewer(harnessRoot, run, providerRunner, gitExecutable);
       run = await loadRun(harnessRoot, run.run_id);
       if (run.state !== 'PLAN_LOOP') break;
@@ -1187,8 +1606,18 @@ async function runPlanLoop(run, options) {
     }
     const manualRoundComplete = run.human_revision_target_round !== null
       && run.plan_review_round >= run.human_revision_target_round;
-    if (manualRoundComplete || run.plan_review_round >= policy.budgets.plan_review_max) {
-      run.last_error = gate.reasons.join('; ');
+    const lineageBudgetExhausted =
+      (run.prior_plan_review_rounds ?? 0) + run.plan_review_round
+      >= policy.budgets.lineage_plan_review_max;
+    if (
+      manualRoundComplete
+      || run.plan_review_round >= policy.budgets.plan_review_max
+      || lineageBudgetExhausted
+    ) {
+      run.last_error = [
+        ...gate.reasons,
+        ...(lineageBudgetExhausted ? ['lineage plan review budget exhausted'] : []),
+      ].join('; ');
       await setState(harnessRoot, run, 'NEEDS_HUMAN', 'plan_gate', run.last_error);
       break;
     }
@@ -1198,6 +1627,252 @@ async function runPlanLoop(run, options) {
     run = await loadRun(harnessRoot, run.run_id);
   }
   return summarize(await loadRun(harnessRoot, run.run_id));
+}
+
+async function stopImplementation(harnessRoot, run, message, action = 'implementation_gate') {
+  run.last_error = message;
+  run.active_step = null;
+  await setState(harnessRoot, run, 'NEEDS_HUMAN', action, message);
+  return summarize(run);
+}
+
+async function runImplementationLoop(run, options) {
+  const { harnessRoot, providerRunner, gitExecutable, processRunner, platform } = options;
+  if (run.active_step) {
+    return stopImplementation(
+      harnessRoot,
+      run,
+      'Codex implementation was interrupted; inspect the preserved partial diff',
+      'codex_implement',
+    );
+  }
+  if (!(await verifyLockedInputs(harnessRoot, run))) return summarize(run);
+  if (
+    run.approved_plan_path !== run.current_plan_path ||
+    run.approved_plan_sha !== run.current_plan_sha ||
+    run.approved_base_sha !== run.base_sha
+  ) {
+    return stopImplementation(harnessRoot, run, 'approved PLAN or base SHA no longer matches');
+  }
+
+  const before = await gitSnapshot(run, gitExecutable);
+  if (before.head !== run.base_sha || before.status_hash !== sha256Bytes(Buffer.from(''))) {
+    return stopImplementation(harnessRoot, run, 'writer worktree drifted before implementation');
+  }
+
+  const root = runRoot(harnessRoot, run.run_id);
+  const specText = await readFile(path.join(root, 'SPEC.md'), 'utf8');
+  const planText = await readFile(path.join(root, run.approved_plan_path), 'utf8');
+  let verificationCommands;
+  let protectedPaths;
+  let protectedDigests;
+  try {
+    verificationCommands = parseVerificationCommands(specText, run.spec.command_ids);
+    protectedPaths = normalizeProtectedPaths((await readPolicy(harnessRoot)).protected_paths);
+    protectedDigests = await protectedPathDigests(run.worktree_path, protectedPaths);
+  } catch (error) {
+    return stopImplementation(harnessRoot, run, error.message);
+  }
+
+  const inputs = {
+    spec: specText,
+    plan: planText,
+    base_sha: run.base_sha,
+    verification_commands: verificationCommands,
+    protected_paths: protectedPaths,
+  };
+  run.active_step = {
+    type: 'codex_implement',
+    round: 1,
+    input_hash: sha256Bytes(Buffer.from(JSON.stringify(inputs))),
+    pre_head: before.head,
+    pre_status_hash: before.status_hash,
+    protected_digests: protectedDigests,
+    attempt: 1,
+    outputs: {
+      stdout: 'reviews/implementation-codex.raw.jsonl',
+      stderr: 'reviews/implementation-codex.stderr.log',
+    },
+  };
+  await saveRun(harnessRoot, run);
+  await event(harnessRoot, run, 'codex_implement_start', 'attempt 1');
+
+  let result;
+  try {
+    result = await providerRunner({
+      step: 'codex_implement',
+      provider: 'codex',
+      runId: run.run_id,
+      round: 1,
+      cwd: run.worktree_path,
+      inputs,
+    });
+  } catch (error) {
+    await atomicWrite(path.join(root, run.active_step.outputs.stdout), '');
+    await atomicWrite(path.join(root, run.active_step.outputs.stderr), error.message);
+    return stopImplementation(harnessRoot, run, error.message, 'codex_implement');
+  }
+  await writeProviderLogs(root, run.active_step.outputs, result);
+  if (result.exitCode !== 0) {
+    return stopImplementation(
+      harnessRoot,
+      run,
+      `Codex implementation exited with code ${result.exitCode}`,
+      'codex_implement',
+    );
+  }
+
+  let paths;
+  let manifest;
+  let diff;
+  try {
+    const afterProtected = await protectedPathDigests(run.worktree_path, protectedPaths);
+    const changedProtected = protectedPaths.find(
+      (relative) => afterProtected[relative] !== protectedDigests[relative],
+    );
+    if (changedProtected) {
+      return stopImplementation(
+        harnessRoot,
+        run,
+        `Codex implementation touched protected path: ${changedProtected}`,
+      );
+    }
+    const head = await gitOutput(gitExecutable, run.worktree_path, ['rev-parse', 'HEAD']);
+    if (head !== run.base_sha) {
+      return stopImplementation(harnessRoot, run, 'Codex implementation changed HEAD', 'codex_implement');
+    }
+    const staged = await stagedPaths(run, gitExecutable);
+    if (staged.length > 0) {
+      return stopImplementation(
+        harnessRoot,
+        run,
+        `Codex implementation staged source changes: ${staged.join(', ')}`,
+      );
+    }
+    const changes = await implementationPaths(run, gitExecutable);
+    paths = changes.paths;
+    if (paths.length === 0) {
+      return stopImplementation(harnessRoot, run, 'Codex implementation produced no diff');
+    }
+    const protectedPath = paths.find((changed) => protectedPaths.some((protectedValue) => {
+      const changedKey = platform === 'win32' ? changed.toLowerCase() : changed;
+      const protectedKey = platform === 'win32' ? protectedValue.toLowerCase() : protectedValue;
+      return changedKey === protectedKey || changedKey.startsWith(`${protectedKey}/`);
+    }));
+    if (protectedPath) {
+      return stopImplementation(
+        harnessRoot,
+        run,
+        `Codex implementation touched protected path: ${protectedPath}`,
+      );
+    }
+    manifest = await implementationManifest(run, paths);
+    diff = await implementationDiff(run, gitExecutable, paths, changes.untracked);
+  } catch (error) {
+    return stopImplementation(harnessRoot, run, error.message);
+  }
+
+  const manifestText = `${JSON.stringify(manifest, null, 2)}\n`;
+  const implementationDigest = sha256Bytes(Buffer.from(manifestText));
+  await atomicWrite(path.join(root, 'implementation.diff'), diff);
+  await atomicWrite(path.join(root, 'implementation-manifest.json'), manifestText);
+  run.implementation = {
+    changed_paths: paths,
+    digest: implementationDigest,
+    manifest_path: 'implementation-manifest.json',
+    diff_path: 'implementation.diff',
+    evidence_paths: [],
+  };
+  await saveRun(harnessRoot, run);
+
+  let expectedSnapshot = await gitSnapshot(run, gitExecutable);
+  for (const verification of verificationCommands) {
+    const startedAt = new Date().toISOString();
+    let commandResult;
+    try {
+      commandResult = await processRunner({
+        ...verificationRequest(verification.command, run.worktree_path, platform),
+        env: options.env,
+      });
+    } catch (error) {
+      commandResult = { exitCode: 5, stdout: '', stderr: error.message };
+    }
+    const finishedAt = new Date().toISOString();
+    let after;
+    let inspectionError = '';
+    try {
+      after = await gitSnapshot(run, gitExecutable);
+    } catch (error) {
+      inspectionError = error.message;
+      after = { head: 'unavailable', status_hash: null };
+    }
+    const evidencePath = `evidence/${verification.id}.log`;
+    await atomicWrite(path.join(root, evidencePath), verificationLog({
+      id: verification.id,
+      command: verification.command,
+      cwd: run.worktree_path,
+      result: commandResult,
+      startedAt,
+      finishedAt,
+      headSha: after.head,
+      inspectionError,
+    }));
+    run.implementation.evidence_paths.push(evidencePath);
+    await saveRun(harnessRoot, run);
+    if (inspectionError) {
+      return stopImplementation(
+        harnessRoot,
+        run,
+        `${verification.id} inspection failed: ${inspectionError}`,
+        'verification',
+      );
+    }
+    if (commandResult.exitCode !== 0) {
+      return stopImplementation(
+        harnessRoot,
+        run,
+        `${verification.id} exited with code ${commandResult.exitCode}`,
+        'verification',
+      );
+    }
+    let verificationChangedWorktree =
+      after.head !== expectedSnapshot.head || after.status_hash !== expectedSnapshot.status_hash;
+    try {
+      const afterProtected = await protectedPathDigests(run.worktree_path, protectedPaths);
+      const afterChanges = await implementationPaths(run, gitExecutable);
+      const afterManifest = await implementationManifest(run, afterChanges.paths);
+      const afterDigest = sha256Bytes(Buffer.from(`${JSON.stringify(afterManifest, null, 2)}\n`));
+      verificationChangedWorktree ||= protectedPaths.some(
+        (relative) => afterProtected[relative] !== protectedDigests[relative],
+      );
+      verificationChangedWorktree ||= (await stagedPaths(run, gitExecutable)).length > 0;
+      verificationChangedWorktree ||= afterDigest !== implementationDigest;
+    } catch {
+      verificationChangedWorktree = true;
+    }
+    if (verificationChangedWorktree) {
+      return stopImplementation(
+        harnessRoot,
+        run,
+        `${verification.id} changed HEAD or worktree status`,
+        'verification',
+      );
+    }
+    expectedSnapshot = after;
+  }
+
+  run.head_sha = expectedSnapshot.head;
+  run.active_step = null;
+  run.last_error = null;
+  await setState(harnessRoot, run, 'READY_FOR_MANUAL_MERGE', 'implementation_gate', 'ready');
+  return summarize(run);
+}
+
+async function runWorkflow(run, options) {
+  if (run.state === 'PLAN_LOOP') return runPlanLoop(run, options);
+  if (run.state === 'IMPLEMENT_LOOP') return runImplementationLoop(run, options);
+  if (TERMINAL_STATES.has(run.state)) return summarize(run);
+  throw new Error(`unsupported state: ${run.state}`);
 }
 
 async function requestPlanRevision(values, options) {
@@ -1217,6 +1892,12 @@ async function requestPlanRevision(values, options) {
   const used = run.human_plan_revision_count ?? 0;
   if (used >= policy.budgets.human_plan_revision_max) {
     throw new Error('human plan revision budget exhausted');
+  }
+  if (
+    (run.prior_plan_review_rounds ?? 0) + run.plan_review_round
+    >= policy.budgets.lineage_plan_review_max
+  ) {
+    throw new Error('lineage plan review budget exhausted');
   }
 
   const root = runRoot(options.harnessRoot, runId);
@@ -1273,6 +1954,8 @@ export async function runCommand(argv, options = {}) {
   const resolved = {
     harnessRoot: path.resolve(options.harnessRoot ?? HERE),
     providerRunner: options.providerRunner,
+    processRunner: options.processRunner ?? runProcess,
+    platform: options.platform ?? process.platform,
     env: options.env ?? process.env,
     gitExecutable: options.gitExecutable ?? 'git',
   };
@@ -1280,24 +1963,39 @@ export async function runCommand(argv, options = {}) {
     resolved.providerRunner = createDefaultProviderRunner({
       harnessRoot: resolved.harnessRoot,
       env: resolved.env,
-      processRunner: options.processRunner,
+      processRunner: resolved.processRunner,
       commands: options.commands,
+      platform: resolved.platform,
     });
   }
   if (command === 'init') return initCommand(values, resolved);
   if (command === 'start') {
     const created = await initCommand(values, resolved);
-    return runPlanLoop(await loadRun(resolved.harnessRoot, created.runId), resolved);
+    return withRunLock(resolved.harnessRoot, created.runId, async () => (
+      runWorkflow(await loadRun(resolved.harnessRoot, created.runId), resolved)
+    ));
   }
   if (command === 'list') return listRunsCommand(values, resolved);
   if (command === 'status') return summarize(await loadRun(resolved.harnessRoot, requireValue(values, 'run')));
   if (command === 'run') {
-    const run = await loadRun(resolved.harnessRoot, requireValue(values, 'run'));
-    return runPlanLoop(run, resolved);
+    const runId = requireValue(values, 'run');
+    return withRunLock(resolved.harnessRoot, runId, async () => {
+      const run = await loadRun(resolved.harnessRoot, runId);
+      return runWorkflow(run, resolved);
+    });
   }
-  if (command === 'approve-plan') return approvePlan(values, resolved);
-  if (command === 'request-plan-revision') return requestPlanRevision(values, resolved);
-  if (command === 'abort') return abortRun(values, resolved);
+  if (command === 'approve-plan') {
+    const runId = requireValue(values, 'run');
+    return withRunLock(resolved.harnessRoot, runId, () => approvePlan(values, resolved));
+  }
+  if (command === 'request-plan-revision') {
+    const runId = requireValue(values, 'run');
+    return withRunLock(resolved.harnessRoot, runId, () => requestPlanRevision(values, resolved));
+  }
+  if (command === 'abort') {
+    const runId = requireValue(values, 'run');
+    return withRunLock(resolved.harnessRoot, runId, () => abortRun(values, resolved));
+  }
   throw new Error(`unknown command: ${command}`);
 }
 

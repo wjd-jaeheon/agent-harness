@@ -13,6 +13,7 @@ export function actionArgv(action, run, input = {}) {
 function menuFor(state) {
   if (state === 'ABORTED' || state === 'DONE') return [['exit', '종료']];
   if (state === 'PLAN_LOOP') return [['continue', '계속'], ['abort', '중단']];
+  if (state === 'IMPLEMENT_LOOP') return [['continue', '구현 실행'], ['abort', '중단']];
   if (state === 'AWAIT_PLAN_APPROVAL') return [['approve', '계획 승인'], ['revise', '계획 보완 요청'], ['abort', '중단']];
   return [['abort', '중단'], ['exit', '종료']];
 }
@@ -40,6 +41,9 @@ export async function launch({ cwd = process.cwd(), runner = runCommand, ask, wr
   write(`선택: ${selected.runId} | ${selected.worktreePath}`);
   const run = await runner(['status', '--run', selected.runId]);
   write(`상태: ${run.state}${run.lastError ? `\n오류: ${run.lastError}` : ''}`);
+  if (run.cursorScoutStatus === 'unavailable') {
+    write(`Cursor Scout: unavailable — ${run.cursorScoutUnavailableReason ?? 'reason unavailable'}`);
+  }
   if (run.state === 'AWAIT_PLAN_APPROVAL') {
     write(`계획: ${run.currentPlanPath}`);
     write(`계획 SHA: ${run.currentPlanSha}`);
