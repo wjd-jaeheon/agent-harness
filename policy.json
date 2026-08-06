@@ -1,7 +1,7 @@
 {
   "models": {
     "planner": {
-      "model": "claude-opus-5",
+      "model": "claude-fable-5",
       "effort": "xhigh"
     },
     "reviewer": {
@@ -14,9 +14,9 @@
     }
   },
   "budgets": {
-    "plan_review_max": 2,
-    "human_plan_revision_max": 1,
-    "lineage_plan_review_max": 20
+    "plan_review_max": 3,
+    "human_plan_revision_max": 2,
+    "lineage_plan_review_max": 10
   },
   "protected_paths": [".git", ".harness"],
   "commands": {
