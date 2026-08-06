@@ -1014,6 +1014,36 @@ test('lastErrorDetail from a spec_gate stop clears once the run recovers', async
   assert.equal(resumed.lastErrorDetail, null, 'a clean gate must not report a stale SPEC defect');
 });
 
+test('aborting a spec_gate stop clears the SPEC defect detail', async (t) => {
+  const f = await fixture(t);
+  const specDefect = {
+    ...finding('F-001'),
+    severity: 'blocker',
+    category: 'spec_defect',
+    evidence: ['SPEC 계약: CMD-001: `git grep -q deploy`'],
+  };
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    { step: 'codex_plan_review', result: { review: review(1, { findings: [specDefect] }) } },
+  ]);
+  const created = await initRun(f, scripted.providerRunner);
+  const first = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+  assert.equal(first.state, 'NEEDS_HUMAN');
+  assert.ok(first.lastErrorDetail, 'spec_gate stop must record blocking finding detail');
+
+  const aborted = await runCommand(
+    ['abort', '--run', created.runId, '--reason', 'SPEC contract is wrong'],
+    { harnessRoot: f.harnessRoot },
+  );
+  assert.equal(aborted.state, 'ABORTED');
+  assert.equal(aborted.lastError, 'SPEC contract is wrong');
+  assert.equal(aborted.lastErrorDetail, null, 'abort must clear stale SPEC defect detail');
+});
+
 test('approve-plan accepts only the exact current plan digest', async (t) => {
   const f = await fixture(t);
   const { created, providerRunner } = await runToApproval(f);
