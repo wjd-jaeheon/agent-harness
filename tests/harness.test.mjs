@@ -751,6 +751,58 @@ test('a CMD that dirties the baseline worktree is restored and flagged', async (
   assert.equal(await git(run.worktree_path, 'status', '--porcelain'), '');
 });
 
+test('이 브랜치 이전에 만들어진 run.json도 status와 run을 그대로 통과한다', async (t) => {
+  const f = await fixture(t);
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    { step: 'codex_plan_review', result: { review: review(1) } },
+  ]);
+  const created = await initRun(f, scripted.providerRunner);
+  const runPath = path.join(f.harnessRoot, '.harness', 'runs', created.runId, 'run.json');
+  const legacy = await readRun(f.harnessRoot, created.runId);
+  for (const key of [
+    'spec_command_baseline',
+    'spec_acceptance_coverage',
+    'last_error_detail',
+    'previous_gate_round',
+  ]) {
+    delete legacy[key];
+  }
+  await writeFile(runPath, `${JSON.stringify(legacy, null, 2)}\n`, 'utf8');
+
+  const status = await runCommand(['status', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+  });
+  assert.deepEqual(status.specCommandBaseline, []);
+  assert.deepEqual(status.specAcceptanceCoverage, []);
+  assert.equal(status.lastErrorDetail, null);
+
+  const result = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+
+  assert.equal(result.state, 'AWAIT_PLAN_APPROVAL');
+  assert.equal(scripted.queue.length, 0);
+});
+
+test('배포되는 SPEC.example.md가 선언한 AC와 CMD 그대로 파싱된다', async (t) => {
+  const f = await fixture(t);
+  const template = await readFile(new URL('../SPEC.example.md', import.meta.url), 'utf8');
+  await writeFile(f.specPath, template, 'utf8');
+  const { providerRunner } = scriptedProvider([]);
+  const created = await initRun(f, providerRunner);
+  const run = await readRun(f.harnessRoot, created.runId);
+
+  assert.deepEqual(run.spec.acceptance_ids, ['AC-001', 'AC-002']);
+  assert.deepEqual(run.spec.command_ids, ['CMD-001', 'CMD-002']);
+  assert.deepEqual(run.spec_acceptance_coverage, [
+    { id: 'AC-001', command_ids: ['CMD-001'] },
+    { id: 'AC-002', command_ids: ['CMD-002'] },
+  ]);
+});
+
 test('full two-review plan loop reaches AWAIT_PLAN_APPROVAL with durable artifacts', async (t) => {
   const f = await fixture(t);
   const { created, result, calls, queue } = await runToApproval(f);
