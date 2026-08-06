@@ -517,6 +517,19 @@ function extractIds(text, prefix) {
   return [...new Set(text.match(new RegExp(`\\b${prefix}-\\d{3}\\b`, 'g')) ?? [])];
 }
 
+/**
+ * 사람이 승인하는 계약과 planner만 읽는 맥락을 한 파일 안에서 가른다.
+ * AC/CMD는 계약 섹션에서만 파싱하므로 맥락 산문은 자유롭게 쓸 수 있다.
+ * 계약 헤딩이 없는 SPEC은 전문이 계약이다 (기존 run 하위호환).
+ */
+function contractSection(specText) {
+  const heading = specText.match(/^\s{0,3}(#{1,6})\s*(?:계약|Contract)\s*$/im);
+  if (!heading) return specText;
+  const rest = specText.slice(heading.index + heading[0].length);
+  const next = rest.match(new RegExp(`^\\s{0,3}#{1,${heading[1].length}}\\s+\\S`, 'm'));
+  return next ? rest.slice(0, next.index) : rest;
+}
+
 function validateSpec(text) {
   const acceptanceIds = extractIds(text, 'AC');
   const commandIds = extractIds(text, 'CMD');
@@ -740,6 +753,7 @@ async function preflightVerificationCommands(specText, commandIds, options) {
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }
+  return commands;
 }
 
 function normalizeProtectedPaths(values) {
@@ -989,8 +1003,9 @@ async function initCommand(values, options) {
   const specPath = path.resolve(requireValue(values, 'spec'));
   const specBytes = await readFile(specPath);
   const specText = specBytes.toString('utf8');
-  const spec = validateSpec(specText);
-  await preflightVerificationCommands(specText, spec.commandIds, options);
+  const contract = contractSection(specText);
+  const spec = validateSpec(contract);
+  const commands = await preflightVerificationCommands(contract, spec.commandIds, options);
   const specSha = sha256Bytes(specBytes);
   const baseSha = await gitOutput(options.gitExecutable, repo, ['rev-parse', 'HEAD']);
   const inside = await gitOutput(options.gitExecutable, repo, ['rev-parse', '--is-inside-work-tree']);
@@ -1744,7 +1759,7 @@ async function runImplementationLoop(run, options) {
   let protectedPaths;
   let protectedDigests;
   try {
-    verificationCommands = parseVerificationCommands(specText, run.spec.command_ids);
+    verificationCommands = parseVerificationCommands(contractSection(specText), run.spec.command_ids);
     protectedPaths = normalizeProtectedPaths((await readPolicy(harnessRoot)).protected_paths);
     protectedDigests = await protectedPathDigests(run.worktree_path, protectedPaths);
   } catch (error) {

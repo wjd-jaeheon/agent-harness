@@ -165,6 +165,43 @@ test('init rejects a verification command the verification shell cannot parse', 
   assert.equal(calls.length, 0);
 });
 
+test('맥락 섹션의 CMD 언급은 필수 검증 명령으로 파싱되지 않는다', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    f.specPath,
+    [
+      '# Toy SPEC',
+      '',
+      '## 계약',
+      '',
+      '- AC-001: update app — 검증: CMD-001',
+      '- CMD-001: `node --version`',
+      '',
+      '## 맥락',
+      '',
+      '이전 시도에서 CMD-004를 썼다가 실패했다. AC-009 형태도 검토했다.',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+  const { providerRunner } = scriptedProvider([]);
+  const created = await initRun(f, providerRunner);
+  const run = await readRun(f.harnessRoot, created.runId);
+
+  assert.deepEqual(run.spec.acceptance_ids, ['AC-001']);
+  assert.deepEqual(run.spec.command_ids, ['CMD-001']);
+});
+
+test('계약 섹션이 없는 SPEC은 전문에서 그대로 파싱된다', async (t) => {
+  const f = await fixture(t);
+  const { providerRunner } = scriptedProvider([]);
+  const created = await initRun(f, providerRunner);
+  const run = await readRun(f.harnessRoot, created.runId);
+
+  assert.deepEqual(run.spec.acceptance_ids, ['AC-001']);
+  assert.deepEqual(run.spec.command_ids, ['CMD-001']);
+});
+
 test('launcher approval maps to one exact approve-plan command', async () => {
   assert.deepEqual(actionArgv('approve', { runId: 'r1', currentPlanSha: 'a'.repeat(64) }), [
     'approve-plan', '--run', 'r1', '--plan-sha', 'a'.repeat(64),
