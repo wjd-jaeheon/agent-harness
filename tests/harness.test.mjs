@@ -850,6 +850,39 @@ test('approved plan runs one Codex implementation and verified diff reaches manu
   );
 });
 
+test('locked CMD sees untracked implementation files through a throwaway index', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    f.specPath,
+    '# Toy SPEC\n\nAC-001: add a new file\n\nCMD-001: `git ls-files --error-unmatch new.txt`\n',
+    'utf8',
+  );
+  const planning = await runToApproval(f);
+  const before = await readRun(f.harnessRoot, planning.created.runId);
+  await runCommand(
+    ['approve-plan', '--run', planning.created.runId, '--plan-sha', before.current_plan_sha],
+    { harnessRoot: f.harnessRoot, providerRunner: planning.providerRunner },
+  );
+
+  const result = await runCommand(['run', '--run', planning.created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: async (request) => {
+      if (request.step !== 'codex_implement') return planning.providerRunner(request);
+      await writeFile(path.join(request.cwd, 'new.txt'), 'new file\n', 'utf8');
+      return { exitCode: 0, stdout: 'implemented', stderr: '' };
+    },
+  });
+  const run = await readRun(f.harnessRoot, planning.created.runId);
+
+  assert.equal(result.state, 'READY_FOR_MANUAL_MERGE');
+  assert.deepEqual(await stagedPathsForTest(run.worktree_path), []);
+});
+
+async function stagedPathsForTest(worktree) {
+  const out = await git(worktree, 'diff', '--cached', '--name-only');
+  return out ? out.split('\n') : [];
+}
+
 test('implementation touching a protected path stops before verification', async (t) => {
   const f = await fixture(t);
   await writeFile(path.join(f.repo, '.gitignore'), '.harness/\n', 'utf8');

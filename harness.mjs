@@ -474,18 +474,19 @@ async function setState(harnessRoot, run, state, action, result) {
   await event(harnessRoot, run, action, result, previous);
 }
 
-async function gitRawOutput(gitExecutable, cwd, args) {
+async function gitRawOutput(gitExecutable, cwd, args, env) {
   const { stdout } = await exec(gitExecutable, args, {
     cwd,
     encoding: 'utf8',
     windowsHide: true,
     maxBuffer: 4 * 1024 * 1024,
+    ...(env ? { env } : {}),
   });
   return stdout;
 }
 
-async function gitOutput(gitExecutable, cwd, args) {
-  return (await gitRawOutput(gitExecutable, cwd, args)).trim();
+async function gitOutput(gitExecutable, cwd, args, env) {
+  return (await gitRawOutput(gitExecutable, cwd, args, env)).trim();
 }
 
 function pathKey(value) {
@@ -1862,79 +1863,105 @@ async function runImplementationLoop(run, options) {
   await saveRun(harnessRoot, run);
 
   let expectedSnapshot = await gitSnapshot(run, gitExecutable);
-  for (const verification of verificationCommands) {
-    const startedAt = new Date().toISOString();
-    let commandResult;
-    try {
-      commandResult = await processRunner({
-        ...verificationRequest(verification.command, run.worktree_path, platform),
-        env: options.env,
-      });
-    } catch (error) {
-      commandResult = { exitCode: 5, stdout: '', stderr: error.message };
+  // locked CMD는 워킹트리에서 돌지만 구현 산출물은 전부 untracked다 (implementer는
+  // stage 금지). 그래서 git grep / ls-files / diff HEAD가 조용히 빈 집합을 본다.
+  // 버릴 인덱스에 산출물을 넣어 CMD에만 건네고, 실제 인덱스는 그대로 둔다.
+  const indexDirectory = await mkdtemp(path.join(tmpdir(), 'agent-harness-index-'));
+  const verificationEnv = {
+    ...options.env,
+    GIT_INDEX_FILE: path.join(indexDirectory, 'index'),
+  };
+  try {
+    // read-tree를 먼저 하지 않으면 .gitignore에 매칭되는 tracked 파일이
+    // add -A 뒤 "삭제"로 보인다.
+    await gitOutput(gitExecutable, run.worktree_path, ['read-tree', 'HEAD'], verificationEnv);
+    await gitOutput(gitExecutable, run.worktree_path, ['add', '-A'], verificationEnv);
+  } catch (error) {
+    await rm(indexDirectory, { recursive: true, force: true });
+    return stopImplementation(
+      harnessRoot,
+      run,
+      `verification index could not be built: ${error.message}`,
+      'verification',
+    );
+  }
+  try {
+    for (const verification of verificationCommands) {
+      const startedAt = new Date().toISOString();
+      let commandResult;
+      try {
+        commandResult = await processRunner({
+          ...verificationRequest(verification.command, run.worktree_path, platform),
+          env: verificationEnv,
+        });
+      } catch (error) {
+        commandResult = { exitCode: 5, stdout: '', stderr: error.message };
+      }
+      const finishedAt = new Date().toISOString();
+      let after;
+      let inspectionError = '';
+      try {
+        after = await gitSnapshot(run, gitExecutable);
+      } catch (error) {
+        inspectionError = error.message;
+        after = { head: 'unavailable', status_hash: null };
+      }
+      const evidencePath = `evidence/${verification.id}.log`;
+      await atomicWrite(path.join(root, evidencePath), verificationLog({
+        id: verification.id,
+        command: verification.command,
+        cwd: run.worktree_path,
+        result: commandResult,
+        startedAt,
+        finishedAt,
+        headSha: after.head,
+        inspectionError,
+      }));
+      run.implementation.evidence_paths.push(evidencePath);
+      await saveRun(harnessRoot, run);
+      if (inspectionError) {
+        return stopImplementation(
+          harnessRoot,
+          run,
+          `${verification.id} inspection failed: ${inspectionError}`,
+          'verification',
+        );
+      }
+      if (commandResult.exitCode !== 0) {
+        return stopImplementation(
+          harnessRoot,
+          run,
+          `${verification.id} exited with code ${commandResult.exitCode}`,
+          'verification',
+        );
+      }
+      let verificationChangedWorktree =
+        after.head !== expectedSnapshot.head || after.status_hash !== expectedSnapshot.status_hash;
+      try {
+        const afterProtected = await protectedPathDigests(run.worktree_path, protectedPaths);
+        const afterChanges = await implementationPaths(run, gitExecutable);
+        const afterManifest = await implementationManifest(run, afterChanges.paths);
+        const afterDigest = sha256Bytes(Buffer.from(`${JSON.stringify(afterManifest, null, 2)}\n`));
+        verificationChangedWorktree ||= protectedPaths.some(
+          (relative) => afterProtected[relative] !== protectedDigests[relative],
+        );
+        verificationChangedWorktree ||= (await stagedPaths(run, gitExecutable)).length > 0;
+        verificationChangedWorktree ||= afterDigest !== implementationDigest;
+      } catch {
+        verificationChangedWorktree = true;
+      }
+      if (verificationChangedWorktree) {
+        return stopImplementation(
+          harnessRoot,
+          run,
+          `${verification.id} changed HEAD or worktree status`,
+          'verification',
+        );
+      }
+      expectedSnapshot = after;
     }
-    const finishedAt = new Date().toISOString();
-    let after;
-    let inspectionError = '';
-    try {
-      after = await gitSnapshot(run, gitExecutable);
-    } catch (error) {
-      inspectionError = error.message;
-      after = { head: 'unavailable', status_hash: null };
-    }
-    const evidencePath = `evidence/${verification.id}.log`;
-    await atomicWrite(path.join(root, evidencePath), verificationLog({
-      id: verification.id,
-      command: verification.command,
-      cwd: run.worktree_path,
-      result: commandResult,
-      startedAt,
-      finishedAt,
-      headSha: after.head,
-      inspectionError,
-    }));
-    run.implementation.evidence_paths.push(evidencePath);
-    await saveRun(harnessRoot, run);
-    if (inspectionError) {
-      return stopImplementation(
-        harnessRoot,
-        run,
-        `${verification.id} inspection failed: ${inspectionError}`,
-        'verification',
-      );
-    }
-    if (commandResult.exitCode !== 0) {
-      return stopImplementation(
-        harnessRoot,
-        run,
-        `${verification.id} exited with code ${commandResult.exitCode}`,
-        'verification',
-      );
-    }
-    let verificationChangedWorktree =
-      after.head !== expectedSnapshot.head || after.status_hash !== expectedSnapshot.status_hash;
-    try {
-      const afterProtected = await protectedPathDigests(run.worktree_path, protectedPaths);
-      const afterChanges = await implementationPaths(run, gitExecutable);
-      const afterManifest = await implementationManifest(run, afterChanges.paths);
-      const afterDigest = sha256Bytes(Buffer.from(`${JSON.stringify(afterManifest, null, 2)}\n`));
-      verificationChangedWorktree ||= protectedPaths.some(
-        (relative) => afterProtected[relative] !== protectedDigests[relative],
-      );
-      verificationChangedWorktree ||= (await stagedPaths(run, gitExecutable)).length > 0;
-      verificationChangedWorktree ||= afterDigest !== implementationDigest;
-    } catch {
-      verificationChangedWorktree = true;
-    }
-    if (verificationChangedWorktree) {
-      return stopImplementation(
-        harnessRoot,
-        run,
-        `${verification.id} changed HEAD or worktree status`,
-        'verification',
-      );
-    }
-    expectedSnapshot = after;
+  } finally {
+    await rm(indexDirectory, { recursive: true, force: true });
   }
 
   run.head_sha = expectedSnapshot.head;
