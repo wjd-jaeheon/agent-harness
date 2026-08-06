@@ -953,6 +953,35 @@ test('a review round that resolves nothing stops the loop even under budget', as
   assert.ok(result.lastErrorDetail.next_action);
 });
 
+test('a review round that omits reclassification of a prior finding stalls the loop', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    path.join(f.harnessRoot, 'policy.json'),
+    JSON.stringify({ budgets: { plan_review_max: 6 } }),
+    'utf8',
+  );
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    { step: 'codex_plan_review', result: { review: review(1, { findings: [finding()] }) } },
+    { step: 'claude_plan_revise', result: { plan: planV2, decision: 'F-001: incorporated' } },
+    // Round 2 says nothing at all about F-001 — not resolved, not still open, not
+    // reported. previous_gate_blocking_ids is genuinely non-empty (F-001, from
+    // round 1); an empty prior_findings here must still stall, not slide through
+    // on "there was nothing to check".
+    { step: 'codex_plan_review', result: { review: review(2, {}) } },
+  ]);
+  const created = await initRun(f, scripted.providerRunner);
+  const result = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+
+  assert.equal(result.state, 'NEEDS_HUMAN');
+  assert.equal(scripted.queue.length, 0, '리바이저를 다시 부르지 않는다');
+  assert.match(result.lastError, /stall/i);
+});
+
 test('a converging review round keeps going past the old three-round ceiling', async (t) => {
   const f = await fixture(t);
   await writeFile(

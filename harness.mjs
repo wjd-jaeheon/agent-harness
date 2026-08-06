@@ -1225,6 +1225,7 @@ async function initCommand(values, options) {
     current_review_path: null,
     last_reviewed_plan_sha: null,
     previous_gate_blocking_ids: [],
+    previous_gate_round: null,
     cursor: {
       scout_attempted: 0,
       scout_status: 'pending',
@@ -1847,19 +1848,15 @@ async function runPlanLoop(run, options) {
       >= policy.budgets.lineage_plan_review_max;
     // Round count is the wrong unit — a reviser that resolves findings should keep
     // getting rounds, one that resolves nothing shouldn't burn more of them. Stall
-    // means: there was something to resolve and none of it closed this round.
-    // Both halves of the guard matter: run.previous_gate_blocking_ids confirms the
-    // harness itself had something outstanding (not just a hallucinated prior
-    // finding), and review.prior_findings.length is what actually gates the
-    // check — previous_gate_blocking_ids gets overwritten with *this* round's own
-    // blocking ids a few lines below, before the reviser call, so a failed
-    // reviser call that retries re-enters this same evaluation with that field
-    // already pointing at itself; review.prior_findings is fixed at review-write
-    // time and stays a reliable "prior findings this round was actually asked to
-    // reclassify" regardless of how many times the retry re-runs this check.
-    const stalled = run.previous_gate_blocking_ids.length > 0
-      && review.prior_findings.length > 0
-      && !review.prior_findings.some((prior) => prior.status === 'resolved');
+    // means: none of the ids blocking as of the *previous* round came back resolved.
+    // previous_gate_round < plan_review_round guards against a retried (failed)
+    // reviser call re-entering this same round's evaluation and comparing a round
+    // against itself.
+    const stalled = (run.previous_gate_round ?? null) !== null
+      && run.previous_gate_round < run.plan_review_round
+      && run.previous_gate_blocking_ids.length > 0
+      && !run.previous_gate_blocking_ids.some((id) =>
+        review.prior_findings.some((prior) => prior.id === id && prior.status === 'resolved'));
     const stopReasons = [];
     if (stalled) {
       stopReasons.push(`plan review stalled at round ${run.plan_review_round}: no previous finding was resolved`);
@@ -1881,6 +1878,7 @@ async function runPlanLoop(run, options) {
       break;
     }
     run.previous_gate_blocking_ids = gate.blockingIds;
+    run.previous_gate_round = run.plan_review_round;
     await saveRun(harnessRoot, run);
     await callReviser(harnessRoot, run, review, providerRunner, gitExecutable);
     run = await loadRun(harnessRoot, run.run_id);
@@ -2194,6 +2192,7 @@ async function requestPlanRevision(values, options) {
   const planText = await readFile(path.join(root, run.current_plan_path), 'utf8');
   const gate = evaluateReview(review, run, planText);
   run.previous_gate_blocking_ids = gate.blockingIds;
+  run.previous_gate_round = run.plan_review_round;
   run.human_plan_revision_count = sequence;
   run.human_revision_target_round = run.plan_review_round + 1;
   run.pending_human_plan_revision_path = relative;
