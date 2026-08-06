@@ -646,6 +646,9 @@ function validateReviewShape(review, expectedRound) {
 }
 
 function evaluateReview(review, run, planText) {
+  // reasons(사람이 읽는 문자열)와 아래 네 배열(구조화된 detail)은 평행하다.
+  // reasons.push만 하고 대응하는 detail push를 빠뜨리면 lastError에는 보이는데
+  // lastErrorDetail에는 없는 항목이 생겨 두 뷰가 조용히 어긋난다.
   const reasons = [];
   const planDefects = [];
   const unresolvedPrior = [];
@@ -717,13 +720,14 @@ function evaluateReview(review, run, planText) {
     planDefects.push('at least one checkpoint is required');
   }
 
+  const blockingFindings = [...blocking.values()];
   return {
     ready: reasons.length === 0,
     reasons,
     blockingIds: [...blocking.keys()],
-    blockingFindings: [...blocking.values()],
+    blockingFindings,
     detail: {
-      blocking_findings: [...blocking.values()],
+      blocking_findings: blockingFindings,
       unresolved_prior_findings: unresolvedPrior,
       failed_acceptance: failedAcceptance,
       plan_defects: planDefects,
@@ -1831,11 +1835,11 @@ async function runPlanLoop(run, options) {
       run.last_error = `SPEC defect blocks planning: ${
         specDefects.map((item) => `${item.id} ${item.claim}`).join('; ')
       }`;
+      // 같은 라운드에 계획 결함도 같이 있으면 그것도 보여준다. SPEC만 고치고 새 run을
+      // 시작한 사람이 못 본 채로 남아 있던 blocker를 다시 만나지 않게.
       run.last_error_detail = {
+        ...gate.detail,
         blocking_findings: specDefects,
-        unresolved_prior_findings: [],
-        failed_acceptance: [],
-        plan_defects: [],
         next_action: 'blocking_findings[].evidence가 가리키는 SPEC 줄을 고치고 --parent-run으로 새 run을 시작한다',
       };
       await setState(harnessRoot, run, 'NEEDS_HUMAN', 'spec_gate', run.last_error);
@@ -1880,8 +1884,22 @@ async function runPlanLoop(run, options) {
     run.previous_gate_blocking_ids = gate.blockingIds;
     run.previous_gate_round = run.plan_review_round;
     await saveRun(harnessRoot, run);
+    const shaBeforeRevision = run.current_plan_sha;
     await callReviser(harnessRoot, run, review, providerRunner, gitExecutable);
     run = await loadRun(harnessRoot, run.run_id);
+    // 리바이저가 바이트 동일한 계획을 돌려주면 리뷰어를 건너뛰어 라운드가 오르지 않는다.
+    // 그러면 stall 룰도 라운드 예산도 영영 발동하지 못한 채 유료 호출만 반복된다.
+    // callReviser의 실패 경로는 전부 던지거나(첫 시도) NEEDS_HUMAN으로 끝나므로,
+    // 여기서 PLAN_LOOP이면서 SHA가 그대로면 "성공했는데 안 바뀐" 경우뿐이다.
+    if (run.state === 'PLAN_LOOP' && run.current_plan_sha === shaBeforeRevision) {
+      run.last_error = `plan review stalled at round ${run.plan_review_round}: reviser returned an unchanged plan`;
+      run.last_error_detail = {
+        ...gate.detail,
+        next_action: '리바이저가 수렴하지 않는다. SPEC을 고치거나 request-plan-revision으로 구체적인 지시를 준다',
+      };
+      await setState(harnessRoot, run, 'NEEDS_HUMAN', 'plan_gate', run.last_error);
+      break;
+    }
   }
   return summarize(await loadRun(harnessRoot, run.run_id));
 }
@@ -2047,6 +2065,16 @@ async function runImplementationLoop(run, options) {
   // locked CMD는 워킹트리에서 돌지만 구현 산출물은 전부 untracked다 (implementer는
   // stage 금지). 그래서 git grep / ls-files / diff HEAD가 조용히 빈 집합을 본다.
   // 버릴 인덱스에 산출물을 넣어 CMD에만 건네고, 실제 인덱스는 그대로 둔다.
+  //
+  // 한계: GIT_INDEX_FILE에는 저장소 범위가 없다. 이 환경변수를 물려받은 CMD가
+  // 다른 git 저장소를 만들거나 조작하면 그 저장소가 이 인덱스를 그대로 쓰게 되고,
+  // 여기 담긴 blob이 저쪽 object DB에는 없어서 "invalid object ... / error: Error
+  // building trees"로 죽는다. 그래서 검증 명령은 다른 git 저장소를 만들거나
+  // 조작하면 안 된다 (SPEC.example.md·SKILL·README에 같은 제약을 적어 뒀다).
+  //
+  // 인덱스는 명령마다가 아니라 루프 전에 한 번만 만든다. 워크트리를 바꾸는 명령은
+  // 아래 verificationChangedWorktree에서 루프를 중단시키므로 인덱스가 낡은 채로
+  // 다음 명령에 넘어가는 경우가 없다.
   const indexDirectory = await mkdtemp(path.join(tmpdir(), 'agent-harness-index-'));
   const verificationEnv = {
     ...options.env,
@@ -2126,6 +2154,8 @@ async function runImplementationLoop(run, options) {
         verificationChangedWorktree ||= protectedPaths.some(
           (relative) => afterProtected[relative] !== protectedDigests[relative],
         );
+        // 이제 CMD의 git add는 버릴 인덱스로 가므로 이 검사에 걸리지 않는다.
+        // 실제 인덱스가 더럽혀졌다는 뜻(= 다른 경로로 스테이징됐다)일 때만 걸린다.
         verificationChangedWorktree ||= (await stagedPaths(run, gitExecutable)).length > 0;
         verificationChangedWorktree ||= afterDigest !== implementationDigest;
       } catch {

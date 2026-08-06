@@ -988,6 +988,37 @@ test('a review round that omits reclassification of a prior finding stalls the l
   assert.match(result.lastError, /stall/i);
 });
 
+test('a reviser that returns the same plan bytes stops instead of spinning', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    path.join(f.harnessRoot, 'policy.json'),
+    JSON.stringify({ budgets: { plan_review_max: 6 } }),
+    'utf8',
+  );
+  // 같은 계획을 그대로 돌려주면 current_plan_sha가 안 바뀌어 리뷰어가 건너뛰어지고
+  // plan_review_round가 영영 안 오른다 — stall 룰도 라운드 예산도 발동하지 못한다.
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    { step: 'codex_plan_review', result: { review: review(1, { findings: [finding()] }) } },
+    { step: 'claude_plan_revise', result: { plan: planV1, decision: 'F-001: incorporated' } },
+  ]);
+  const created = await initRun(f, scripted.providerRunner);
+  const result = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+  const revisions = scripted.calls.filter((call) => call.step === 'claude_plan_revise');
+
+  assert.equal(result.state, 'NEEDS_HUMAN');
+  assert.equal(revisions.length, 1, '수렴하지 않는 리바이저를 두 번 부르지 않는다');
+  assert.equal(scripted.queue.length, 0);
+  assert.match(result.lastError, /unchanged plan/i);
+  assert.equal(result.planReviewRound, 1);
+  assert.ok(result.lastErrorDetail.next_action);
+  assert.equal(result.lastErrorDetail.blocking_findings.length, 1);
+});
+
 test('a converging review round keeps going past the old three-round ceiling', async (t) => {
   const f = await fixture(t);
   await writeFile(
@@ -1055,6 +1086,36 @@ test('a blocking spec_defect stops the loop immediately at spec_gate', async (t)
   assert.ok(events.some(({ action }) => action === 'spec_gate'));
   assert.equal(result.lastErrorDetail.blocking_findings[0].category, 'spec_defect');
   assert.match(result.lastErrorDetail.blocking_findings[0].evidence[0], /CMD-001/);
+});
+
+test('spec_gate는 같은 라운드에 함께 있던 계획 결함도 버리지 않는다', async (t) => {
+  const f = await fixture(t);
+  const specDefect = {
+    ...finding('F-001'),
+    severity: 'blocker',
+    category: 'spec_defect',
+    evidence: ['SPEC 계약: CMD-001: `git grep -q deploy`'],
+  };
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    {
+      step: 'codex_plan_review',
+      // SPEC 결함과 계획 결함이 한 라운드에 같이 온다. SPEC만 고쳐 새 run을 시작한
+      // 사람이 못 본 계획 blocker를 그때 처음 만나면 안 된다.
+      result: { review: review(1, { findings: [specDefect], ac: [], checkpoints: 0 }) },
+    },
+  ]);
+  const created = await initRun(f, scripted.providerRunner);
+  const result = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+
+  assert.equal(result.state, 'NEEDS_HUMAN');
+  assert.deepEqual(result.lastErrorDetail.blocking_findings.map(({ id }) => id), ['F-001']);
+  assert.ok(result.lastErrorDetail.plan_defects.length > 0, '계획 결함이 그대로 남는다');
+  assert.deepEqual(result.lastErrorDetail.failed_acceptance.map(({ id }) => id), ['AC-001']);
 });
 
 test('a finding without a category is treated as a plan defect', async (t) => {
