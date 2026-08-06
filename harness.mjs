@@ -1014,6 +1014,7 @@ function verificationLog({
 
 async function stopForLockedInput(harnessRoot, run, label, detail) {
   run.last_error = `${label} locked digest changed${detail ? `: ${detail}` : ''}`;
+  run.last_error_detail = null;
   run.active_step = null;
   await setState(harnessRoot, run, 'NEEDS_HUMAN', 'locked_input', run.last_error);
   return false;
@@ -1200,6 +1201,7 @@ async function initCommand(values, options) {
     },
     active_step: null,
     last_error: null,
+    last_error_detail: null,
     approved_plan_path: null,
     approved_plan_sha: null,
     approved_base_sha: null,
@@ -1376,6 +1378,7 @@ async function beginStep(harnessRoot, run, type, round, inputs, gitExecutable) {
 async function recordStepFailure(harnessRoot, run, error) {
   const message = error instanceof Error ? error.message : String(error);
   run.last_error = message;
+  run.last_error_detail = null;
   if (run.active_step?.attempt >= 2) {
     const type = run.active_step.type;
     run.active_step = null;
@@ -1399,11 +1402,13 @@ async function writeProviderLogs(root, outputs, result) {
 async function finishStep(harnessRoot, run) {
   run.active_step = null;
   run.last_error = null;
+  run.last_error_detail = null;
   await saveRun(harnessRoot, run);
 }
 
 async function markBoundaryViolation(harnessRoot, run, type) {
   run.last_error = `${type} changed HEAD or worktree status`;
+  run.last_error_detail = null;
   run.active_step = null;
   await setState(harnessRoot, run, 'NEEDS_HUMAN', type, run.last_error);
 }
@@ -1778,6 +1783,7 @@ async function runPlanLoop(run, options) {
     const gate = evaluateReview(review, run, planText);
     if (gate.ready) {
       run.last_error = null;
+      run.last_error_detail = null;
       await setState(harnessRoot, run, 'AWAIT_PLAN_APPROVAL', 'plan_gate', 'ready');
       break;
     }
@@ -1827,6 +1833,7 @@ async function runPlanLoop(run, options) {
 
 async function stopImplementation(harnessRoot, run, message, action = 'implementation_gate') {
   run.last_error = message;
+  run.last_error_detail = null;
   run.active_step = null;
   await setState(harnessRoot, run, 'NEEDS_HUMAN', action, message);
   return summarize(run);
@@ -2135,6 +2142,7 @@ async function requestPlanRevision(values, options) {
   run.pending_human_plan_revision_path = relative;
   run.latest_human_plan_revision_path = relative;
   run.last_error = null;
+  run.last_error_detail = null;
   await setState(options.harnessRoot, run, 'PLAN_LOOP', 'request_plan_revision', relative);
   return summarize(run);
 }
@@ -2166,6 +2174,7 @@ async function abortRun(values, options) {
   if (CLOSED_RUN_STATES.has(run.state)) throw new Error('run is already closed');
   const reason = requireValue(values, 'reason');
   run.last_error = reason;
+  run.last_error_detail = null;
   run.active_step = null;
   await setState(options.harnessRoot, run, 'ABORTED', 'abort', reason);
   return summarize(run);

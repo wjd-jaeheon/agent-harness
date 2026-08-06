@@ -968,6 +968,52 @@ test('a finding without a category is treated as a plan defect', async (t) => {
   assert.equal(scripted.queue.length, 0);
 });
 
+test('lastErrorDetail from a spec_gate stop clears once the run recovers', async (t) => {
+  const f = await fixture(t);
+  const specDefect = {
+    ...finding('F-001'),
+    severity: 'blocker',
+    category: 'spec_defect',
+    evidence: ['SPEC 계약: CMD-001: `git grep -q deploy`'],
+  };
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    { step: 'codex_plan_review', result: { review: review(1, { findings: [specDefect] }) } },
+  ]);
+  const created = await initRun(f, scripted.providerRunner);
+  const first = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+  assert.equal(first.state, 'NEEDS_HUMAN');
+  assert.ok(first.lastErrorDetail, 'spec_gate stop must record blocking finding detail');
+
+  const notePath = path.join(f.root, 'human-plan-note.md');
+  await writeFile(notePath, '# Human request\n\nSPEC fixed upstream; retry.\n', 'utf8');
+  scripted.queue.push(
+    { step: 'claude_plan_revise', result: { plan: planV2, decision: 'F-001: incorporated' } },
+    {
+      step: 'codex_plan_review',
+      result: { review: review(2, { prior: [{ id: 'F-001', status: 'resolved' }] }) },
+    },
+  );
+
+  const requested = await runCommand(
+    ['request-plan-revision', '--run', created.runId, '--note-file', notePath],
+    { harnessRoot: f.harnessRoot, providerRunner: scripted.providerRunner },
+  );
+  assert.equal(requested.state, 'PLAN_LOOP');
+  assert.equal(requested.lastErrorDetail, null, 'recovering from spec_gate must clear stale detail');
+
+  const resumed = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+  assert.equal(resumed.state, 'AWAIT_PLAN_APPROVAL');
+  assert.equal(resumed.lastErrorDetail, null, 'a clean gate must not report a stale SPEC defect');
+});
+
 test('approve-plan accepts only the exact current plan digest', async (t) => {
   const f = await fixture(t);
   const { created, providerRunner } = await runToApproval(f);
