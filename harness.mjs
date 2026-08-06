@@ -647,16 +647,28 @@ function validateReviewShape(review, expectedRound) {
 
 function evaluateReview(review, run, planText) {
   const reasons = [];
+  const planDefects = [];
+  const unresolvedPrior = [];
+  const failedAcceptance = [];
+  const blocking = new Map();
+
   const plan = validatePlan(planText, run);
-  if (!plan.valid) reasons.push(plan.reason);
+  if (!plan.valid) {
+    reasons.push(plan.reason);
+    planDefects.push(plan.reason);
+  }
 
   const priorById = new Map(review.prior_findings.map((item) => [item.id, item.status]));
   for (const id of run.previous_gate_blocking_ids) {
-    if (!priorById.has(id)) reasons.push(`previous finding ${id} was not reclassified`);
-    else if (priorById.get(id) === 'open') reasons.push(`previous finding ${id} remains open`);
+    if (!priorById.has(id)) {
+      reasons.push(`previous finding ${id} was not reclassified`);
+      unresolvedPrior.push({ id, status: 'unreclassified' });
+    } else if (priorById.get(id) === 'open') {
+      reasons.push(`previous finding ${id} remains open`);
+      unresolvedPrior.push({ id, status: 'open' });
+    }
   }
 
-  const blocking = new Map();
   for (const finding of review.findings) {
     const serious = finding.severity === 'blocker' || finding.severity === 'major';
     if (!serious && !finding.needs_evidence) continue;
@@ -672,29 +684,51 @@ function evaluateReview(review, run, planText) {
 
   const checksById = new Map();
   for (const check of review.ac_checks) {
-    if (checksById.has(check.id)) reasons.push(`AC ${check.id} is duplicated`);
+    if (checksById.has(check.id)) {
+      reasons.push(`AC ${check.id} is duplicated`);
+      planDefects.push(`AC ${check.id} is duplicated`);
+    }
     checksById.set(check.id, check);
   }
   if (checksById.size !== run.spec.acceptance_ids.length) {
     reasons.push('AC checks do not exactly match the SPEC');
+    planDefects.push('AC checks do not exactly match the SPEC');
   }
   for (const id of run.spec.acceptance_ids) {
     const check = checksById.get(id);
-    if (!check) reasons.push(`AC ${id} is missing`);
-    else if (
+    if (!check) {
+      reasons.push(`AC ${id} is missing`);
+      failedAcceptance.push({ id, status: 'missing', reason: 'review omitted this AC' });
+    } else if (
       check.status !== 'pass' ||
       !check.implementation_ref?.trim() ||
       !check.verification_ref?.trim()
     ) {
       reasons.push(`AC ${id} is not fully mapped and passing`);
+      failedAcceptance.push({
+        id,
+        status: check.status,
+        reason: `implementation_ref=${check.implementation_ref || '(empty)'} verification_ref=${check.verification_ref || '(empty)'}`,
+      });
     }
   }
-  if (review.checkpoint_count < 1) reasons.push('at least one checkpoint is required');
+  if (review.checkpoint_count < 1) {
+    reasons.push('at least one checkpoint is required');
+    planDefects.push('at least one checkpoint is required');
+  }
+
   return {
     ready: reasons.length === 0,
     reasons,
     blockingIds: [...blocking.keys()],
     blockingFindings: [...blocking.values()],
+    detail: {
+      blocking_findings: [...blocking.values()],
+      unresolved_prior_findings: unresolvedPrior,
+      failed_acceptance: failedAcceptance,
+      plan_defects: planDefects,
+      next_action: null,
+    },
   };
 }
 
@@ -1811,15 +1845,38 @@ async function runPlanLoop(run, options) {
     const lineageBudgetExhausted =
       (run.prior_plan_review_rounds ?? 0) + run.plan_review_round
       >= policy.budgets.lineage_plan_review_max;
-    if (
-      manualRoundComplete
-      || run.plan_review_round >= policy.budgets.plan_review_max
-      || lineageBudgetExhausted
-    ) {
-      run.last_error = [
-        ...gate.reasons,
-        ...(lineageBudgetExhausted ? ['lineage plan review budget exhausted'] : []),
-      ].join('; ');
+    // Round count is the wrong unit — a reviser that resolves findings should keep
+    // getting rounds, one that resolves nothing shouldn't burn more of them. Stall
+    // means: there was something to resolve and none of it closed this round.
+    // Both halves of the guard matter: run.previous_gate_blocking_ids confirms the
+    // harness itself had something outstanding (not just a hallucinated prior
+    // finding), and review.prior_findings.length is what actually gates the
+    // check — previous_gate_blocking_ids gets overwritten with *this* round's own
+    // blocking ids a few lines below, before the reviser call, so a failed
+    // reviser call that retries re-enters this same evaluation with that field
+    // already pointing at itself; review.prior_findings is fixed at review-write
+    // time and stays a reliable "prior findings this round was actually asked to
+    // reclassify" regardless of how many times the retry re-runs this check.
+    const stalled = run.previous_gate_blocking_ids.length > 0
+      && review.prior_findings.length > 0
+      && !review.prior_findings.some((prior) => prior.status === 'resolved');
+    const stopReasons = [];
+    if (stalled) {
+      stopReasons.push(`plan review stalled at round ${run.plan_review_round}: no previous finding was resolved`);
+    }
+    if (run.plan_review_round >= policy.budgets.plan_review_max) {
+      stopReasons.push('plan review budget exhausted');
+    }
+    if (lineageBudgetExhausted) stopReasons.push('lineage plan review budget exhausted');
+    if (manualRoundComplete) stopReasons.push('requested human revision round is complete');
+    if (stopReasons.length > 0) {
+      run.last_error = [...stopReasons, ...gate.reasons].join('; ');
+      run.last_error_detail = {
+        ...gate.detail,
+        next_action: stalled
+          ? '리바이저가 수렴하지 않는다. SPEC을 고치거나 request-plan-revision으로 구체적인 지시를 준다'
+          : 'blocking_findings를 확인하고 request-plan-revision을 보내거나 --parent-run으로 새 run을 시작한다',
+      };
       await setState(harnessRoot, run, 'NEEDS_HUMAN', 'plan_gate', run.last_error);
       break;
     }

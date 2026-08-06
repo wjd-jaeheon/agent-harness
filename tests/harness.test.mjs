@@ -915,6 +915,82 @@ test('a second blocked review stops at NEEDS_HUMAN without a third call', async 
   assert.equal(scripted.queue.length, 0);
 });
 
+test('a review round that resolves nothing stops the loop even under budget', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    path.join(f.harnessRoot, 'policy.json'),
+    JSON.stringify({ budgets: { plan_review_max: 6 } }),
+    'utf8',
+  );
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    { step: 'codex_plan_review', result: { review: review(1, { findings: [finding()] }) } },
+    { step: 'claude_plan_revise', result: { plan: planV2, decision: 'F-001: incorporated' } },
+    {
+      step: 'codex_plan_review',
+      result: {
+        review: review(2, {
+          findings: [finding('F-001')],
+          prior: [{ id: 'F-001', status: 'open' }],
+        }),
+      },
+    },
+  ]);
+  const created = await initRun(f, scripted.providerRunner);
+  const result = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+
+  assert.equal(result.state, 'NEEDS_HUMAN');
+  assert.equal(scripted.queue.length, 0, '예산이 남아도 헛돌면 더 안 돈다');
+  assert.match(result.lastError, /stall/i);
+  assert.equal(result.lastErrorDetail.blocking_findings.length, 1, 'F-001이 한 번만 나온다');
+  assert.deepEqual(result.lastErrorDetail.unresolved_prior_findings, [
+    { id: 'F-001', status: 'open' },
+  ]);
+  assert.ok(result.lastErrorDetail.next_action);
+});
+
+test('a converging review round keeps going past the old three-round ceiling', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    path.join(f.harnessRoot, 'policy.json'),
+    JSON.stringify({ budgets: { plan_review_max: 6 } }),
+    'utf8',
+  );
+  const planV3 = planV2.replace('CP-001', 'CP-001\n\nCP-002');
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    { step: 'codex_plan_review', result: { review: review(1, { findings: [finding('F-001')] }) } },
+    { step: 'claude_plan_revise', result: { plan: planV2, decision: 'F-001: incorporated' } },
+    {
+      step: 'codex_plan_review',
+      result: {
+        review: review(2, {
+          findings: [finding('F-002')],
+          prior: [{ id: 'F-001', status: 'resolved' }],
+        }),
+      },
+    },
+    { step: 'claude_plan_revise', result: { plan: planV3, decision: 'F-002: incorporated' } },
+    {
+      step: 'codex_plan_review',
+      result: { review: review(3, { prior: [{ id: 'F-002', status: 'resolved' }] }) },
+    },
+  ]);
+  const created = await initRun(f, scripted.providerRunner);
+  const result = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+
+  assert.equal(result.state, 'AWAIT_PLAN_APPROVAL');
+  assert.equal(scripted.queue.length, 0);
+});
+
 test('a blocking spec_defect stops the loop immediately at spec_gate', async (t) => {
   const f = await fixture(t);
   const specDefect = {
