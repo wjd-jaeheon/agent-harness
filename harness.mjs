@@ -29,6 +29,11 @@ const TERMINAL_STATES = new Set([
 ]);
 const CLOSED_RUN_STATES = new Set(['ABORTED', 'DONE']);
 const DEFAULT_POLICY = {
+  models: {
+    planner: { model: 'claude-fable-5', effort: 'xhigh' },
+    reviewer: { model: 'gpt-5.6-sol', effort: 'ultra' },
+    implementer: { model: 'gpt-5.6-sol', effort: 'xhigh' },
+  },
   budgets: {
     plan_review_max: 2,
     human_plan_revision_max: 1,
@@ -159,6 +164,10 @@ export function createDefaultProviderRunner({
   );
 
   return async (request) => {
+    const policy = await readPolicy(harnessRoot);
+    // policy.json "commands" pins provider binaries; bare names come from PATH,
+    // where a stale codex.exe once shadowed the current one for a whole session.
+    const command = { ...resolvedCommands, ...policy.commands };
     if (request.provider === 'cursor') {
       if (env.CURSOR_API_KEY?.trim()) {
         return {
@@ -170,13 +179,13 @@ export function createDefaultProviderRunner({
       }
       const scoutPrompt = await prompt('cursor-scout.md', request.inputs);
       const result = await processRunner({
-        command: resolvedCommands.powershell,
+        command: command.powershell,
         args: [
           '-NoLogo',
           '-NoProfile',
           '-NonInteractive',
           '-File',
-          resolvedCommands.agentScript,
+          command.agentScript,
           '-p',
           '--output-format',
           'text',
@@ -187,9 +196,12 @@ export function createDefaultProviderRunner({
           '--workspace',
           request.cwd,
           '--trust',
-          scoutPrompt,
         ],
         cwd: request.cwd,
+        // The prompt goes over stdin: as a positional argument PowerShell -File
+        // re-splits it, so any line starting with a dash (e.g. "rm -rf") became
+        // an unknown option and Scout silently reported unavailable.
+        input: scoutPrompt,
         env,
       });
       return { ...result, scout: result.stdout };
@@ -202,6 +214,10 @@ export function createDefaultProviderRunner({
       const revising = request.step === 'claude_plan_revise';
       const input = await prompt(revising ? 'plan-reviser.md' : 'planner.md', request.inputs);
       const args = [
+        '--model',
+        policy.models.planner.model,
+        '--effort',
+        policy.models.planner.effort,
         '-p',
         '--output-format',
         revising ? 'json' : 'text',
@@ -213,7 +229,7 @@ export function createDefaultProviderRunner({
       ];
       if (revising) args.push('--json-schema', JSON.stringify(REVISER_SCHEMA));
       const result = await processRunner({
-        command: resolvedCommands.claude,
+        command: command.claude,
         args,
         cwd: request.cwd,
         input,
@@ -240,10 +256,15 @@ export function createDefaultProviderRunner({
       }
       if (request.step === 'codex_implement') {
         const input = await prompt('implementer.md', request.inputs);
+        const { model, effort } = policy.models.implementer;
         return processRunner({
-          command: resolvedCommands.codex,
+          command: command.codex,
           args: [
             'exec',
+            '-m',
+            model,
+            '-c',
+            `model_reasoning_effort="${effort}"`,
             '--sandbox',
             'workspace-write',
             '--json',
@@ -258,13 +279,18 @@ export function createDefaultProviderRunner({
         });
       }
       const input = await prompt('plan-reviewer.md', { ...request.inputs, round: request.round });
+      const { model, effort } = policy.models.reviewer;
       const temporary = await mkdtemp(path.join(tmpdir(), 'agent-harness-codex-'));
       const output = path.join(temporary, 'last-message.json');
       try {
         const result = await processRunner({
-          command: resolvedCommands.codex,
+          command: command.codex,
           args: [
             'exec',
+            '-m',
+            model,
+            '-c',
+            `model_reasoning_effort="${effort}"`,
             '--sandbox',
             'read-only',
             '--json',
@@ -527,7 +553,7 @@ function validatePlan(text, run) {
     for (const id of run.cursor.scout_ids) {
       const escaped = id.replace('-', '\\-');
       const disposition = new RegExp(
-        `^${escaped}:\\s*(incorporated|rejected)\\s*(?:—|-)\\s*.+$`,
+        `^(?:[-*]\\s+)?${escaped}:\\s*(incorporated|rejected)\\s*(?:—|-)\\s*.+$`,
         'm',
       );
       if (!disposition.test(text)) {
@@ -542,7 +568,7 @@ function validateDecision(text, review) {
   if (!text?.trim()) return { valid: false, reason: 'Claude decision is empty' };
   for (const finding of review.findings) {
     const escaped = finding.id.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const disposition = new RegExp(`^${escaped}:\\s*(incorporated|rejected)\\b`, 'm');
+    const disposition = new RegExp(`^(?:[-*]\\s+)?${escaped}:\\s*(incorporated|rejected)\\b`, 'm');
     if (!disposition.test(text)) {
       return { valid: false, reason: `Claude decision is missing ${finding.id}` };
     }
@@ -645,11 +671,17 @@ async function readPolicy(harnessRoot) {
   if (!(await exists(file))) return structuredClone(DEFAULT_POLICY);
   const parsed = JSON.parse(await readFile(file, 'utf8'));
   return {
+    models: {
+      planner: { ...DEFAULT_POLICY.models.planner, ...parsed.models?.planner },
+      reviewer: { ...DEFAULT_POLICY.models.reviewer, ...parsed.models?.reviewer },
+      implementer: { ...DEFAULT_POLICY.models.implementer, ...parsed.models?.implementer },
+    },
     budgets: {
       ...DEFAULT_POLICY.budgets,
       ...parsed.budgets,
     },
     protected_paths: parsed.protected_paths ?? DEFAULT_POLICY.protected_paths,
+    commands: parsed.commands ?? {},
   };
 }
 
@@ -664,6 +696,49 @@ function parseVerificationCommands(specText, expectedIds) {
     if (!commands.has(id)) throw new Error(`${id} needs one backtick-wrapped executable command`);
   }
   return expectedIds.map((id) => ({ id, command: commands.get(id) }));
+}
+
+/**
+ * Fails at `init` instead of after a full plan+review cycle: an undefined CMD-###
+ * mentioned in prose, or a command the verification shell cannot even parse.
+ */
+async function preflightVerificationCommands(specText, commandIds, options) {
+  const commands = parseVerificationCommands(specText, commandIds);
+  const temporary = await mkdtemp(path.join(tmpdir(), 'agent-harness-preflight-'));
+  try {
+    for (const { id, command } of commands) {
+      if (options.platform === 'win32' && /^\s*(?:bash|sh)(?:\.exe)?\s/i.test(command)) {
+        throw new Error(
+          `${id} invokes bare "bash"; on Windows that resolves to the WSL launcher. Use an absolute path such as C:\\PROGRA~1\\Git\\bin\\bash.exe`,
+        );
+      }
+      const file = path.join(temporary, `${id}.txt`);
+      await writeFile(file, command, 'utf8');
+      const request = options.platform === 'win32'
+        ? {
+          command: 'powershell.exe',
+          args: [
+            '-NoLogo',
+            '-NoProfile',
+            '-NonInteractive',
+            '-Command',
+            `$e=$null;[void][System.Management.Automation.Language.Parser]::ParseFile('${file}',[ref]$null,[ref]$e);if($e.Count){[Console]::Error.WriteLine($e[0].Message);exit 1}`,
+          ],
+        }
+        : { command: '/bin/sh', args: ['-n', file] };
+      const result = await options.processRunner({
+        ...request,
+        cwd: temporary,
+        timeoutMs: 60 * 1000,
+        env: options.env,
+      });
+      if (result.exitCode !== 0) {
+        throw new Error(`${id} is not parseable by the verification shell: ${result.stderr.trim()}`);
+      }
+    }
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
 }
 
 function normalizeProtectedPaths(values) {
@@ -914,6 +989,7 @@ async function initCommand(values, options) {
   const specBytes = await readFile(specPath);
   const specText = specBytes.toString('utf8');
   const spec = validateSpec(specText);
+  await preflightVerificationCommands(specText, spec.commandIds, options);
   const specSha = sha256Bytes(specBytes);
   const baseSha = await gitOutput(options.gitExecutable, repo, ['rev-parse', 'HEAD']);
   const inside = await gitOutput(options.gitExecutable, repo, ['rev-parse', '--is-inside-work-tree']);

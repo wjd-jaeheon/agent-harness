@@ -35,7 +35,7 @@ async function fixture(t) {
   await git(repo, 'commit', '-m', 'base');
 
   const specPath = path.join(root, 'SPEC.md');
-  const spec = '# Toy SPEC\n\nAC-001: update app\n\nCMD-001: verify app\n';
+  const spec = '# Toy SPEC\n\nAC-001: update app\n\nCMD-001: `node --version`\n';
   await writeFile(specPath, spec, 'utf8');
   await writeFile(
     path.join(harnessRoot, 'policy.json'),
@@ -138,6 +138,33 @@ async function readRun(harnessRoot, runId) {
   return JSON.parse(await readFile(file, 'utf8'));
 }
 
+test('init rejects a CMD id that the SPEC mentions but never defines', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    f.specPath,
+    '# Toy SPEC\n\nAC-001: update app\n\nCMD-001: `node --version`\n\nSee CMD-004 for details.\n',
+    'utf8',
+  );
+  const { providerRunner, calls } = scriptedProvider([]);
+  await assert.rejects(
+    () => initRun(f, providerRunner),
+    /CMD-004 needs one backtick-wrapped executable command/,
+  );
+  assert.equal(calls.length, 0, 'no provider may run before the SPEC is proven executable');
+});
+
+test('init rejects a verification command the verification shell cannot parse', async (t) => {
+  const f = await fixture(t);
+  const broken = process.platform === 'win32' ? 'node --version && node --version' : 'node --version )';
+  await writeFile(f.specPath, `# Toy SPEC\n\nAC-001: update app\n\nCMD-001: \`${broken}\`\n`, 'utf8');
+  const { providerRunner, calls } = scriptedProvider([]);
+  await assert.rejects(
+    () => initRun(f, providerRunner),
+    /CMD-001 is not parseable by the verification shell/,
+  );
+  assert.equal(calls.length, 0);
+});
+
 test('launcher approval maps to one exact approve-plan command', async () => {
   assert.deepEqual(actionArgv('approve', { runId: 'r1', currentPlanSha: 'a'.repeat(64) }), [
     'approve-plan', '--run', 'r1', '--plan-sha', 'a'.repeat(64),
@@ -165,6 +192,9 @@ test('tracked pingpong skill connects a task to the public plan runner', async (
   assert.match(skill, /명시적 승인.*전에는.*Cursor Scout.*provider.*subagent.*호출하지 않는다/s);
   assert.match(skill, /최종 SPEC 요약.*명시적 승인.*승인 뒤.*harness\.mjs.*start/s);
   assert.match(skill, /수정.*SPEC.*다시.*승인/s);
+  assert.match(skill, /계획을 바꾸는 미확정 맥락.*한 번에 하나씩/s);
+  assert.match(skill, /현재 코드에서 답을 확인할 수 있으면.*묻지 않는다/s);
+  assert.match(skill, /미확정 맥락이 하나라도 남아 있으면 SPEC으로 넘어가지 않는다/);
   assert.match(skill, /runner.*상태 전이/s);
   assert.match(skill, /cursorScoutUnavailableReason.*보여/s);
   assert.match(skill, /--parent-run "<이전 runId>"/);
@@ -401,7 +431,7 @@ test('list finds no run, one run, and multiple active runs for a repo', async (t
   assert.equal(single.selectedRunId, first.runId);
   assert.equal(single.runs[0].taskSummary, 'Toy SPEC');
 
-  await writeFile(f.specPath, '# Other SPEC\n\nAC-001: other task\n\nCMD-001: verify other task\n', 'utf8');
+  await writeFile(f.specPath, '# Other SPEC\n\nAC-001: other task\n\nCMD-001: `node --version`\n', 'utf8');
   const second = await initRun(f);
   const listed = await runCommand(['list', '--repo', f.repo], { harnessRoot: f.harnessRoot });
   assert.equal(listed.selectedRunId, null);
@@ -422,8 +452,8 @@ test('list finds taskSummary from the first locked SPEC heading', async (t) => {
   const f = await fixture(t);
   const created = await initRun(f);
   const lockedSpec = path.join(f.harnessRoot, '.harness', 'runs', created.runId, 'SPEC.md');
-  await writeFile(f.specPath, '# Changed source SPEC\n\nAC-001: changed\n\nCMD-001: changed\n', 'utf8');
-  await writeFile(lockedSpec, '\uFEFF  ## Locked task title\n\nAC-001: update app\n\nCMD-001: verify app\n', 'utf8');
+  await writeFile(f.specPath, '# Changed source SPEC\n\nAC-001: changed\n\nCMD-001: `node --version`\n', 'utf8');
+  await writeFile(lockedSpec, '\uFEFF  ## Locked task title\n\nAC-001: update app\n\nCMD-001: `node --version`\n', 'utf8');
 
   const listed = await runCommand(['list', '--repo', f.repo], { harnessRoot: f.harnessRoot });
   assert.equal(listed.runs[0].taskSummary, 'Locked task title');
@@ -461,7 +491,7 @@ test('list from a managed writer worktree selects only its owner run', async (t)
   const owner = await initRun(f);
   await writeFile(
     f.specPath,
-    '# Second task\n\nAC-001: update app differently\n\nCMD-001: verify app\n',
+    '# Second task\n\nAC-001: update app differently\n\nCMD-001: `node --version`\n',
     'utf8',
   );
   await initRun(f);
@@ -1116,7 +1146,7 @@ test('an explicit parent run carries its latest plan and review into the new pla
   );
   await writeFile(
     f.specPath,
-    '# Toy SPEC v2\n\nAC-001: update app with the revised contract\n\nCMD-001: verify app\n',
+    '# Toy SPEC v2\n\nAC-001: update app with the revised contract\n\nCMD-001: `node --version`\n',
     'utf8',
   );
   const childProvider = scriptedProvider([
@@ -1156,7 +1186,7 @@ test('an active run cannot be used as a carryover parent', async (t) => {
   const parent = await runToApproval(f);
   await writeFile(
     f.specPath,
-    '# Toy SPEC v2\n\nAC-001: update app with the revised contract\n\nCMD-001: verify app\n',
+    '# Toy SPEC v2\n\nAC-001: update app with the revised contract\n\nCMD-001: `node --version`\n',
     'utf8',
   );
 
@@ -1188,7 +1218,7 @@ test('the lineage review budget stops a child before another revision cycle', as
   );
   await writeFile(
     f.specPath,
-    '# Toy SPEC v2\n\nAC-001: update app with the revised contract\n\nCMD-001: verify app\n',
+    '# Toy SPEC v2\n\nAC-001: update app with the revised contract\n\nCMD-001: `node --version`\n',
     'utf8',
   );
   const childProvider = scriptedProvider([
@@ -1573,6 +1603,13 @@ test('default provider parses Claude planner and reviser outputs', async () => {
   assert.equal(planned.plan, planV1);
   assert.equal(revised.plan, planV2);
   assert.equal(revised.decision, 'F-001: incorporated');
+  const { planner } = JSON.parse(
+    await readFile(new URL('../policy.json', import.meta.url), 'utf8'),
+  ).models;
+  assert.deepEqual(
+    calls[0].args.slice(calls[0].args.indexOf('--model'), calls[0].args.indexOf('--model') + 4),
+    ['--model', planner.model, '--effort', planner.effort],
+  );
   assert.ok(calls[0].args.includes('--permission-mode'));
   assert.ok(calls[0].args.includes('plan'));
   assert.ok(calls[1].args.includes('--json-schema'));
@@ -1611,6 +1648,10 @@ test('default provider reads Codex structured review from output-last-message', 
   });
 
   assert.deepEqual(result.review, expected);
+  assert.deepEqual(
+    calls[0].args.slice(calls[0].args.indexOf('-m'), calls[0].args.indexOf('-m') + 4),
+    ['-m', 'gpt-5.6-sol', '-c', 'model_reasoning_effort="ultra"'],
+  );
   for (const required of ['exec', '--sandbox', 'read-only', '--json', '--output-schema', '--output-last-message', '--ephemeral', '--color', 'never', '-']) {
     assert.ok(calls[0].args.includes(required), required);
   }
@@ -1646,6 +1687,10 @@ test('default provider gives Codex implementation workspace-write without review
 
   assert.equal(result.exitCode, 0);
   assert.ok(calls[0].args.includes('workspace-write'));
+  assert.deepEqual(
+    calls[0].args.slice(calls[0].args.indexOf('-m'), calls[0].args.indexOf('-m') + 4),
+    ['-m', 'gpt-5.6-sol', '-c', 'model_reasoning_effort="xhigh"'],
+  );
   for (const forbidden of ['read-only', '--output-schema', '--output-last-message']) {
     assert.ok(!calls[0].args.includes(forbidden), forbidden);
   }

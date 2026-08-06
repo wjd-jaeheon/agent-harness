@@ -1,8 +1,25 @@
 {
+  "models": {
+    "planner": {
+      "model": "claude-opus-5",
+      "effort": "xhigh"
+    },
+    "reviewer": {
+      "model": "gpt-5.6-sol",
+      "effort": "ultra"
+    },
+    "implementer": {
+      "model": "gpt-5.6-sol",
+      "effort": "xhigh"
+    }
+  },
   "budgets": {
     "plan_review_max": 2,
     "human_plan_revision_max": 1,
-    "lineage_plan_review_max": 6
+    "lineage_plan_review_max": 20
   },
-  "protected_paths": [".git", ".harness"]
+  "protected_paths": [".git", ".harness"],
+  "commands": {
+    "codex": "C:\\Users\\wjdbi\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\bin\\codex.exe"
+  }
 }
