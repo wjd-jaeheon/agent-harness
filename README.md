@@ -4,7 +4,9 @@
 
 ```text
 Claude 요구사항 확인
-→ 사람의 최종 SPEC·핑퐁 시작 승인
+→ 사람의 최종 SPEC 승인
+→ init: base_sha에서 CMD 베이스라인 실행
+→ 사람이 베이스라인 보고 핑퐁 시작 승인
 Cursor Scout 1회
 → Claude 계획
 → Codex 적대 리뷰
@@ -45,7 +47,7 @@ Orca에서는 Agent Permissions를 `Manual`로 두고 custom args에 `--dangerou
 /pingpong 다운로드 파일에서 이메일·메신저 말투를 학습하는 기능
 ```
 
-인수 없이 `/pingpong`만 입력하면 `무슨 작업을 계획할까요?`라고 묻는다. 새 작업은 저장소에서 확인할 수 없는 계획 변경 맥락만 한 번에 하나씩 질문하고, 요구사항이 정리되면 목표·제외 범위·완료 기준·검증 명령을 최종 SPEC 요약으로 보여준다. 사용자가 승인해야만 기존 runner의 `start`를 호출한다. 이후 Cursor Scout → Claude 계획 → Codex 적대 검토 → 필요시 Claude 수정 → Codex 재검토 후 최종 계획 승인에서 멈춘다.
+인수 없이 `/pingpong`만 입력하면 `무슨 작업을 계획할까요?`라고 묻는다. 새 작업은 저장소에서 확인할 수 없는 계획 변경 맥락만 한 번에 하나씩 질문하고, 요구사항이 정리되면 목표·제외 범위·완료 기준·검증 명령을 최종 SPEC 요약으로 보여준다. 사용자가 승인해야만 runner의 `init`을 호출한다. `init`은 provider를 부르지 않고 base_sha에서 `CMD-###`만 실행하므로, 그 결과(`specCommandBaseline`, `specAcceptanceCoverage`)를 사람이 보고 SPEC을 고칠지 진행할지 정한 뒤에야 같은 run에 `run`을 호출한다. 이후 Cursor Scout → Claude 계획 → Codex 적대 검토 → 필요시 Claude 수정 → Codex 재검토 후 최종 계획 승인에서 멈춘다.
 
 기존 작업은 다음으로 연다.
 
@@ -82,6 +84,10 @@ node .\harness.mjs init `
   --spec "D:\path\to\SPEC.md"
 ```
 
+`init`은 새 worktree를 base_sha로 만든 뒤 SPEC 계약 섹션의 `CMD-###`를 **거기서 한 번 실행한다**. 결과는 `specCommandBaseline`에, `AC-###`별 판정 명령은 `specAcceptanceCoverage`에 담겨 나온다. base에서 통과하는 CMD는 변경 전에도 통과한다는 뜻이므로 이번 작업을 판정하지 못할 수 있다. 자동 거부는 하지 않으니 사람이 보고 판단한다.
+
+검증 명령은 멱등·비파괴여야 한다. runner가 base_sha에서 한 번, 구현 뒤에 또 한 번 실행하기 때문이다. 배포·마이그레이션은 검증이 아니라 작업이다.
+
 출력의 `runId`를 복사한다. 이후 모든 명령은 이 ID를 명시한다.
 
 ```powershell
@@ -94,7 +100,7 @@ node .\harness.mjs status --run $run
 
 - `AWAIT_PLAN_APPROVAL`: 계획 검토 가능
 - `READY_FOR_MANUAL_MERGE`: 구현 diff와 필수 검증 통과
-- `NEEDS_HUMAN`: 예산 소진 또는 경계 위반. `lastError` 확인
+- `NEEDS_HUMAN`: 수렴 정지, 예산 소진, 경계 위반, 또는 SPEC 결함. `lastError`와 `lastErrorDetail.next_action` 확인
 
 ## 5. 계획 읽고 결정
 
@@ -161,7 +167,8 @@ node .\harness.mjs run --run $run
 ## 현재 한계
 
 - checkpoint별 Claude 코드 리뷰·Codex fix 루프는 아직 없다.
-- verification command는 SPEC에서 `CMD-001: \`실행할 명령\`` 형식이어야 한다.
+- verification command는 SPEC `## 계약` 섹션에서 `CMD-001: \`실행할 명령\`` 형식이어야 한다. `## 맥락` 섹션의 언급은 파싱되지 않는다.
+- verification command는 다른 git 저장소를 만들거나 조작하면 안 된다. runner가 구현 산출물을 보여주려고 임시 git 인덱스를 환경변수로 넘기는데 이 환경변수에는 저장소 범위가 없어서, 다른 디렉터리에서 `git init`·`git add`·`git commit`을 하는 명령은 이 저장소의 인덱스를 물려받아 `invalid object ... / error: Error building trees`로 실패한다. base_sha 실행은 통과하고 구현 뒤 검증에서만 실패한다.
 - GitHub 자동 병합은 없다. 최종 병합은 사람이 한다.
 - Orca orchestration은 쓰지 않는다.
 - Cursor 독립 감사는 아직 없다.

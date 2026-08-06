@@ -165,6 +165,98 @@ test('init rejects a verification command the verification shell cannot parse', 
   assert.equal(calls.length, 0);
 });
 
+test('맥락 섹션의 CMD 언급은 필수 검증 명령으로 파싱되지 않는다', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    f.specPath,
+    [
+      '# Toy SPEC',
+      '',
+      '## 계약',
+      '',
+      '- AC-001: update app — 검증: CMD-001',
+      '- CMD-001: `node --version`',
+      '',
+      '## 맥락',
+      '',
+      '이전 시도에서 CMD-004를 썼다가 실패했다. AC-009 형태도 검토했다.',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+  const { providerRunner } = scriptedProvider([]);
+  const created = await initRun(f, providerRunner);
+  const run = await readRun(f.harnessRoot, created.runId);
+
+  assert.deepEqual(run.spec.acceptance_ids, ['AC-001']);
+  assert.deepEqual(run.spec.command_ids, ['CMD-001']);
+});
+
+test('계약 섹션이 없는 SPEC은 전문에서 그대로 파싱된다', async (t) => {
+  const f = await fixture(t);
+  const { providerRunner } = scriptedProvider([]);
+  const created = await initRun(f, providerRunner);
+  const run = await readRun(f.harnessRoot, created.runId);
+
+  assert.deepEqual(run.spec.acceptance_ids, ['AC-001']);
+  assert.deepEqual(run.spec.command_ids, ['CMD-001']);
+});
+
+test('계약 섹션 안의 하위 소제목은 경계가 아니고, 형제 헤딩만 경계다', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    f.specPath,
+    [
+      '# Toy SPEC',
+      '',
+      '## 계약',
+      '',
+      '### 수용 조건',
+      '',
+      '- AC-001: update app — 검증: CMD-001',
+      '',
+      '### 필수 검증 명령',
+      '',
+      '- CMD-001: `node --version`',
+      '',
+      '## 맥락',
+      '',
+      'CMD-004는 여기서만 언급된다. AC-009도 마찬가지다.',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+  const { providerRunner } = scriptedProvider([]);
+  const created = await initRun(f, providerRunner);
+  const run = await readRun(f.harnessRoot, created.runId);
+
+  assert.deepEqual(run.spec.acceptance_ids, ['AC-001']);
+  assert.deepEqual(run.spec.command_ids, ['CMD-001']);
+});
+
+test('계약 섹션이 파일의 마지막 섹션이어도(뒤따르는 헤딩이 없어도) 파싱된다', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    f.specPath,
+    [
+      '# Toy SPEC',
+      '',
+      '## 계약',
+      '',
+      '- AC-001: update app — 검증: CMD-001',
+      '- CMD-001: `node --version`',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+  const { providerRunner } = scriptedProvider([]);
+  const created = await initRun(f, providerRunner);
+  const run = await readRun(f.harnessRoot, created.runId);
+
+  assert.deepEqual(run.spec.acceptance_ids, ['AC-001']);
+  assert.deepEqual(run.spec.command_ids, ['CMD-001']);
+});
+
 test('launcher approval maps to one exact approve-plan command', async () => {
   assert.deepEqual(actionArgv('approve', { runId: 'r1', currentPlanSha: 'a'.repeat(64) }), [
     'approve-plan', '--run', 'r1', '--plan-sha', 'a'.repeat(64),
@@ -181,16 +273,17 @@ test('tracked pingpong skill connects a task to the public plan runner', async (
   assert.match(skill, /^disable-model-invocation: true$/m);
   assert.match(skill, /\$ARGUMENTS/);
   assert.match(skill, /무슨 작업을 계획할까요\?/);
-  assert.match(skill, /harness\.mjs"?\s+start --repo/);
+  assert.match(skill, /harness\.mjs"?\s+init --repo/);
+  assert.match(skill, /harness\.mjs"?\s+run --run/);
   assert.match(skill, /pingpong resume/);
   assert.match(skill, /사용자가 명시한 저장소.*현재 Git root.*다르면/s);
   assert.match(skill, /\$env:TEMP/);
   assert.doesNotMatch(skill, /\.harness\/inputs/);
   assert.match(skill, /\.harness\/runs\/<runId>\/<currentPlanPath>/);
   assert.match(skill, /최종 SPEC 요약/);
-  assert.match(skill, /명시적 승인.*전에는.*harness\.mjs.*start/s);
+  assert.match(skill, /명시적 승인.*전에는.*harness\.mjs.*init/s);
   assert.match(skill, /명시적 승인.*전에는.*Cursor Scout.*provider.*subagent.*호출하지 않는다/s);
-  assert.match(skill, /최종 SPEC 요약.*명시적 승인.*승인 뒤.*harness\.mjs.*start/s);
+  assert.match(skill, /최종 SPEC 요약.*명시적 승인.*승인 뒤.*harness\.mjs.*init/s);
   assert.match(skill, /수정.*SPEC.*다시.*승인/s);
   assert.match(skill, /계획을 바꾸는 미확정 맥락.*한 번에 하나씩/s);
   assert.match(skill, /현재 코드에서 답을 확인할 수 있으면.*묻지 않는다/s);
@@ -198,6 +291,17 @@ test('tracked pingpong skill connects a task to the public plan runner', async (
   assert.match(skill, /runner.*상태 전이/s);
   assert.match(skill, /cursorScoutUnavailableReason.*보여/s);
   assert.match(skill, /--parent-run "<이전 runId>"/);
+  assert.match(skill, /## 계약[\s\S]*## 맥락/);
+  assert.match(skill, /멱등.*비파괴/);
+  assert.match(skill, /specCommandBaseline/);
+  assert.match(skill, /specAcceptanceCoverage/);
+  assert.match(skill, /`exit_code`가 `null`/);
+  assert.match(skill, /다른 git 저장소/);
+  // baseline 보고는 provider에 돈을 쓰기 전에 온다: init --repo → baseline → run --run.
+  assert.ok(newWork.indexOf('init --repo') < newWork.indexOf('specCommandBaseline'));
+  assert.ok(newWork.indexOf('specCommandBaseline') < newWork.indexOf('run --run'));
+  assert.match(skill, /사용자 말과 현재 코드가 어긋나면.*묻는다/s);
+  assert.match(skill, /lastErrorDetail/);
   assert.match(newWork, /새 작업 진입 시점부터.*명시적 승인.*Cursor Scout.*provider.*subagent.*호출하지 않는다/s);
   assert.ok(newWork.indexOf('새 작업 진입 시점부터') < newWork.indexOf('1. 현재 Git root'));
   assert.doesNotMatch(newWork, /launcher\.mjs/);
@@ -596,6 +700,109 @@ test('init creates a durable PLAN_LOOP run without provider calls', async (t) =>
   assert.deepEqual(scripted.calls, []);
 });
 
+test('init runs every CMD at base_sha and reports the result', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    f.specPath,
+    [
+      '# Toy SPEC',
+      '',
+      '## 계약',
+      '',
+      '- AC-001: app.txt가 그대로다 — 검증: CMD-001',
+      '- AC-002: 새 파일이 생긴다 — 검증: 수동',
+      '- CMD-001: `node --version`',
+      '- CMD-002: `git ls-files --error-unmatch new.txt`',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+  const { providerRunner } = scriptedProvider([]);
+  const created = await initRun(f, providerRunner);
+  const run = await readRun(f.harnessRoot, created.runId);
+
+  assert.deepEqual(
+    run.spec_command_baseline.map(({ id, exit_code }) => [id, exit_code]),
+    [['CMD-001', 0], ['CMD-002', 1]],
+  );
+  assert.deepEqual(created.specCommandBaseline, run.spec_command_baseline);
+  assert.deepEqual(run.spec_acceptance_coverage, [
+    { id: 'AC-001', command_ids: ['CMD-001'] },
+    { id: 'AC-002', command_ids: [] },
+  ]);
+  assert.equal(await git(run.worktree_path, 'status', '--porcelain'), '');
+});
+
+test('a CMD that dirties the baseline worktree is restored and flagged', async (t) => {
+  const f = await fixture(t);
+  const dirty = process.platform === 'win32'
+    ? 'Set-Content -Path probe.txt -Value x'
+    : 'printf x > probe.txt';
+  await writeFile(
+    f.specPath,
+    `# Toy SPEC\n\nAC-001: update app\n\nCMD-001: \`${dirty}\`\n`,
+    'utf8',
+  );
+  const { providerRunner } = scriptedProvider([]);
+  const created = await initRun(f, providerRunner);
+  const run = await readRun(f.harnessRoot, created.runId);
+
+  assert.equal(run.spec_command_baseline[0].mutated_worktree, true);
+  assert.equal(await git(run.worktree_path, 'status', '--porcelain'), '');
+});
+
+test('이 브랜치 이전에 만들어진 run.json도 status와 run을 그대로 통과한다', async (t) => {
+  const f = await fixture(t);
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    { step: 'codex_plan_review', result: { review: review(1) } },
+  ]);
+  const created = await initRun(f, scripted.providerRunner);
+  const runPath = path.join(f.harnessRoot, '.harness', 'runs', created.runId, 'run.json');
+  const legacy = await readRun(f.harnessRoot, created.runId);
+  for (const key of [
+    'spec_command_baseline',
+    'spec_acceptance_coverage',
+    'last_error_detail',
+    'previous_gate_round',
+  ]) {
+    delete legacy[key];
+  }
+  await writeFile(runPath, `${JSON.stringify(legacy, null, 2)}\n`, 'utf8');
+
+  const status = await runCommand(['status', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+  });
+  assert.deepEqual(status.specCommandBaseline, []);
+  assert.deepEqual(status.specAcceptanceCoverage, []);
+  assert.equal(status.lastErrorDetail, null);
+
+  const result = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+
+  assert.equal(result.state, 'AWAIT_PLAN_APPROVAL');
+  assert.equal(scripted.queue.length, 0);
+});
+
+test('배포되는 SPEC.example.md가 선언한 AC와 CMD 그대로 파싱된다', async (t) => {
+  const f = await fixture(t);
+  const template = await readFile(new URL('../SPEC.example.md', import.meta.url), 'utf8');
+  await writeFile(f.specPath, template, 'utf8');
+  const { providerRunner } = scriptedProvider([]);
+  const created = await initRun(f, providerRunner);
+  const run = await readRun(f.harnessRoot, created.runId);
+
+  assert.deepEqual(run.spec.acceptance_ids, ['AC-001', 'AC-002']);
+  assert.deepEqual(run.spec.command_ids, ['CMD-001', 'CMD-002']);
+  assert.deepEqual(run.spec_acceptance_coverage, [
+    { id: 'AC-001', command_ids: ['CMD-001'] },
+    { id: 'AC-002', command_ids: ['CMD-002'] },
+  ]);
+});
+
 test('full two-review plan loop reaches AWAIT_PLAN_APPROVAL with durable artifacts', async (t) => {
   const f = await fixture(t);
   const { created, result, calls, queue } = await runToApproval(f);
@@ -772,6 +979,301 @@ test('a second blocked review stops at NEEDS_HUMAN without a third call', async 
   assert.equal(scripted.queue.length, 0);
 });
 
+test('a review round that resolves nothing stops the loop even under budget', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    path.join(f.harnessRoot, 'policy.json'),
+    JSON.stringify({ budgets: { plan_review_max: 6 } }),
+    'utf8',
+  );
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    { step: 'codex_plan_review', result: { review: review(1, { findings: [finding()] }) } },
+    { step: 'claude_plan_revise', result: { plan: planV2, decision: 'F-001: incorporated' } },
+    {
+      step: 'codex_plan_review',
+      result: {
+        review: review(2, {
+          findings: [finding('F-001')],
+          prior: [{ id: 'F-001', status: 'open' }],
+        }),
+      },
+    },
+  ]);
+  const created = await initRun(f, scripted.providerRunner);
+  const result = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+
+  assert.equal(result.state, 'NEEDS_HUMAN');
+  assert.equal(scripted.queue.length, 0, '예산이 남아도 헛돌면 더 안 돈다');
+  assert.match(result.lastError, /stall/i);
+  assert.equal(result.lastErrorDetail.blocking_findings.length, 1, 'F-001이 한 번만 나온다');
+  assert.deepEqual(result.lastErrorDetail.unresolved_prior_findings, [
+    { id: 'F-001', status: 'open' },
+  ]);
+  assert.ok(result.lastErrorDetail.next_action);
+});
+
+test('a review round that omits reclassification of a prior finding stalls the loop', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    path.join(f.harnessRoot, 'policy.json'),
+    JSON.stringify({ budgets: { plan_review_max: 6 } }),
+    'utf8',
+  );
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    { step: 'codex_plan_review', result: { review: review(1, { findings: [finding()] }) } },
+    { step: 'claude_plan_revise', result: { plan: planV2, decision: 'F-001: incorporated' } },
+    // Round 2 says nothing at all about F-001 — not resolved, not still open, not
+    // reported. previous_gate_blocking_ids is genuinely non-empty (F-001, from
+    // round 1); an empty prior_findings here must still stall, not slide through
+    // on "there was nothing to check".
+    { step: 'codex_plan_review', result: { review: review(2, {}) } },
+  ]);
+  const created = await initRun(f, scripted.providerRunner);
+  const result = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+
+  assert.equal(result.state, 'NEEDS_HUMAN');
+  assert.equal(scripted.queue.length, 0, '리바이저를 다시 부르지 않는다');
+  assert.match(result.lastError, /stall/i);
+});
+
+test('a reviser that returns the same plan bytes stops instead of spinning', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    path.join(f.harnessRoot, 'policy.json'),
+    JSON.stringify({ budgets: { plan_review_max: 6 } }),
+    'utf8',
+  );
+  // 같은 계획을 그대로 돌려주면 current_plan_sha가 안 바뀌어 리뷰어가 건너뛰어지고
+  // plan_review_round가 영영 안 오른다 — stall 룰도 라운드 예산도 발동하지 못한다.
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    { step: 'codex_plan_review', result: { review: review(1, { findings: [finding()] }) } },
+    { step: 'claude_plan_revise', result: { plan: planV1, decision: 'F-001: incorporated' } },
+  ]);
+  const created = await initRun(f, scripted.providerRunner);
+  const result = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+  const revisions = scripted.calls.filter((call) => call.step === 'claude_plan_revise');
+
+  assert.equal(result.state, 'NEEDS_HUMAN');
+  assert.equal(revisions.length, 1, '수렴하지 않는 리바이저를 두 번 부르지 않는다');
+  assert.equal(scripted.queue.length, 0);
+  assert.match(result.lastError, /unchanged plan/i);
+  assert.equal(result.planReviewRound, 1);
+  assert.ok(result.lastErrorDetail.next_action);
+  assert.equal(result.lastErrorDetail.blocking_findings.length, 1);
+});
+
+test('a converging review round keeps going past the old three-round ceiling', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    path.join(f.harnessRoot, 'policy.json'),
+    JSON.stringify({ budgets: { plan_review_max: 6 } }),
+    'utf8',
+  );
+  const planV3 = planV2.replace('CP-001', 'CP-001\n\nCP-002');
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    { step: 'codex_plan_review', result: { review: review(1, { findings: [finding('F-001')] }) } },
+    { step: 'claude_plan_revise', result: { plan: planV2, decision: 'F-001: incorporated' } },
+    {
+      step: 'codex_plan_review',
+      result: {
+        review: review(2, {
+          findings: [finding('F-002')],
+          prior: [{ id: 'F-001', status: 'resolved' }],
+        }),
+      },
+    },
+    { step: 'claude_plan_revise', result: { plan: planV3, decision: 'F-002: incorporated' } },
+    {
+      step: 'codex_plan_review',
+      result: { review: review(3, { prior: [{ id: 'F-002', status: 'resolved' }] }) },
+    },
+  ]);
+  const created = await initRun(f, scripted.providerRunner);
+  const result = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+
+  assert.equal(result.state, 'AWAIT_PLAN_APPROVAL');
+  assert.equal(scripted.queue.length, 0);
+});
+
+test('a blocking spec_defect stops the loop immediately at spec_gate', async (t) => {
+  const f = await fixture(t);
+  const specDefect = {
+    ...finding('F-001'),
+    severity: 'blocker',
+    category: 'spec_defect',
+    evidence: ['SPEC 계약: CMD-001: `git grep -q deploy`'],
+  };
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    { step: 'codex_plan_review', result: { review: review(1, { findings: [specDefect] }) } },
+  ]);
+  const created = await initRun(f, scripted.providerRunner);
+  const result = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+  const events = (await readFile(
+    path.join(f.harnessRoot, '.harness', 'runs', created.runId, 'events.jsonl'),
+    'utf8',
+  )).trim().split('\n').map((line) => JSON.parse(line));
+
+  assert.equal(result.state, 'NEEDS_HUMAN');
+  assert.equal(scripted.queue.length, 0, '리바이저를 호출하지 않는다');
+  assert.match(result.lastError, /SPEC/i);
+  assert.ok(events.some(({ action }) => action === 'spec_gate'));
+  assert.equal(result.lastErrorDetail.blocking_findings[0].category, 'spec_defect');
+  assert.match(result.lastErrorDetail.blocking_findings[0].evidence[0], /CMD-001/);
+});
+
+test('spec_gate는 같은 라운드에 함께 있던 계획 결함도 버리지 않는다', async (t) => {
+  const f = await fixture(t);
+  const specDefect = {
+    ...finding('F-001'),
+    severity: 'blocker',
+    category: 'spec_defect',
+    evidence: ['SPEC 계약: CMD-001: `git grep -q deploy`'],
+  };
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    {
+      step: 'codex_plan_review',
+      // SPEC 결함과 계획 결함이 한 라운드에 같이 온다. SPEC만 고쳐 새 run을 시작한
+      // 사람이 못 본 계획 blocker를 그때 처음 만나면 안 된다.
+      result: { review: review(1, { findings: [specDefect], ac: [], checkpoints: 0 }) },
+    },
+  ]);
+  const created = await initRun(f, scripted.providerRunner);
+  const result = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+
+  assert.equal(result.state, 'NEEDS_HUMAN');
+  assert.deepEqual(result.lastErrorDetail.blocking_findings.map(({ id }) => id), ['F-001']);
+  assert.ok(result.lastErrorDetail.plan_defects.length > 0, '계획 결함이 그대로 남는다');
+  assert.deepEqual(result.lastErrorDetail.failed_acceptance.map(({ id }) => id), ['AC-001']);
+});
+
+test('a finding without a category is treated as a plan defect', async (t) => {
+  const f = await fixture(t);
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    { step: 'codex_plan_review', result: { review: review(1, { findings: [finding()] }) } },
+    { step: 'claude_plan_revise', result: { plan: planV2, decision: 'F-001: incorporated' } },
+    {
+      step: 'codex_plan_review',
+      result: { review: review(2, { prior: [{ id: 'F-001', status: 'resolved' }] }) },
+    },
+  ]);
+  const created = await initRun(f, scripted.providerRunner);
+  const result = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+
+  assert.equal(result.state, 'AWAIT_PLAN_APPROVAL');
+  assert.equal(scripted.queue.length, 0);
+});
+
+test('lastErrorDetail from a spec_gate stop clears once the run recovers', async (t) => {
+  const f = await fixture(t);
+  const specDefect = {
+    ...finding('F-001'),
+    severity: 'blocker',
+    category: 'spec_defect',
+    evidence: ['SPEC 계약: CMD-001: `git grep -q deploy`'],
+  };
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    { step: 'codex_plan_review', result: { review: review(1, { findings: [specDefect] }) } },
+  ]);
+  const created = await initRun(f, scripted.providerRunner);
+  const first = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+  assert.equal(first.state, 'NEEDS_HUMAN');
+  assert.ok(first.lastErrorDetail, 'spec_gate stop must record blocking finding detail');
+
+  const notePath = path.join(f.root, 'human-plan-note.md');
+  await writeFile(notePath, '# Human request\n\nSPEC fixed upstream; retry.\n', 'utf8');
+  scripted.queue.push(
+    { step: 'claude_plan_revise', result: { plan: planV2, decision: 'F-001: incorporated' } },
+    {
+      step: 'codex_plan_review',
+      result: { review: review(2, { prior: [{ id: 'F-001', status: 'resolved' }] }) },
+    },
+  );
+
+  const requested = await runCommand(
+    ['request-plan-revision', '--run', created.runId, '--note-file', notePath],
+    { harnessRoot: f.harnessRoot, providerRunner: scripted.providerRunner },
+  );
+  assert.equal(requested.state, 'PLAN_LOOP');
+  assert.equal(requested.lastErrorDetail, null, 'recovering from spec_gate must clear stale detail');
+
+  const resumed = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+  assert.equal(resumed.state, 'AWAIT_PLAN_APPROVAL');
+  assert.equal(resumed.lastErrorDetail, null, 'a clean gate must not report a stale SPEC defect');
+});
+
+test('aborting a spec_gate stop clears the SPEC defect detail', async (t) => {
+  const f = await fixture(t);
+  const specDefect = {
+    ...finding('F-001'),
+    severity: 'blocker',
+    category: 'spec_defect',
+    evidence: ['SPEC 계약: CMD-001: `git grep -q deploy`'],
+  };
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    { step: 'codex_plan_review', result: { review: review(1, { findings: [specDefect] }) } },
+  ]);
+  const created = await initRun(f, scripted.providerRunner);
+  const first = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+  assert.equal(first.state, 'NEEDS_HUMAN');
+  assert.ok(first.lastErrorDetail, 'spec_gate stop must record blocking finding detail');
+
+  const aborted = await runCommand(
+    ['abort', '--run', created.runId, '--reason', 'SPEC contract is wrong'],
+    { harnessRoot: f.harnessRoot },
+  );
+  assert.equal(aborted.state, 'ABORTED');
+  assert.equal(aborted.lastError, 'SPEC contract is wrong');
+  assert.equal(aborted.lastErrorDetail, null, 'abort must clear stale SPEC defect detail');
+});
+
 test('approve-plan accepts only the exact current plan digest', async (t) => {
   const f = await fixture(t);
   const { created, providerRunner } = await runToApproval(f);
@@ -849,6 +1351,39 @@ test('approved plan runs one Codex implementation and verified diff reaches manu
       .every(({ mode }) => Number.isInteger(mode)),
   );
 });
+
+test('locked CMD sees untracked implementation files through a throwaway index', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    f.specPath,
+    '# Toy SPEC\n\nAC-001: add a new file\n\nCMD-001: `git ls-files --error-unmatch new.txt`\n',
+    'utf8',
+  );
+  const planning = await runToApproval(f);
+  const before = await readRun(f.harnessRoot, planning.created.runId);
+  await runCommand(
+    ['approve-plan', '--run', planning.created.runId, '--plan-sha', before.current_plan_sha],
+    { harnessRoot: f.harnessRoot, providerRunner: planning.providerRunner },
+  );
+
+  const result = await runCommand(['run', '--run', planning.created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: async (request) => {
+      if (request.step !== 'codex_implement') return planning.providerRunner(request);
+      await writeFile(path.join(request.cwd, 'new.txt'), 'new file\n', 'utf8');
+      return { exitCode: 0, stdout: 'implemented', stderr: '' };
+    },
+  });
+  const run = await readRun(f.harnessRoot, planning.created.runId);
+
+  assert.equal(result.state, 'READY_FOR_MANUAL_MERGE');
+  assert.deepEqual(await stagedPathsForTest(run.worktree_path), []);
+});
+
+async function stagedPathsForTest(worktree) {
+  const out = await git(worktree, 'diff', '--cached', '--name-only');
+  return out ? out.split('\n') : [];
+}
 
 test('implementation touching a protected path stops before verification', async (t) => {
   const f = await fixture(t);

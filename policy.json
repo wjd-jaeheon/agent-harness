@@ -14,7 +14,7 @@
     }
   },
   "budgets": {
-    "plan_review_max": 3,
+    "plan_review_max": 6,
     "human_plan_revision_max": 2,
     "lineage_plan_review_max": 10
   },

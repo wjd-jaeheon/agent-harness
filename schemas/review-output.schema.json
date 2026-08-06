@@ -12,12 +12,13 @@
         "properties": {
           "id": { "type": "string", "minLength": 1 },
           "severity": { "type": "string", "enum": ["blocker", "major", "minor"] },
+          "category": { "type": "string", "enum": ["plan_defect", "spec_defect"] },
           "claim": { "type": "string" },
           "failure_scenario": { "type": "string" },
           "evidence": { "type": "array", "items": { "type": "string" } },
           "needs_evidence": { "type": "boolean" }
         },
-        "required": ["id", "severity", "claim", "failure_scenario", "evidence", "needs_evidence"]
+        "required": ["id", "severity", "category", "claim", "failure_scenario", "evidence", "needs_evidence"]
       }
     },
     "prior_findings": {

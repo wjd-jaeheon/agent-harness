@@ -474,18 +474,19 @@ async function setState(harnessRoot, run, state, action, result) {
   await event(harnessRoot, run, action, result, previous);
 }
 
-async function gitRawOutput(gitExecutable, cwd, args) {
+async function gitRawOutput(gitExecutable, cwd, args, env) {
   const { stdout } = await exec(gitExecutable, args, {
     cwd,
     encoding: 'utf8',
     windowsHide: true,
     maxBuffer: 4 * 1024 * 1024,
+    ...(env ? { env } : {}),
   });
   return stdout;
 }
 
-async function gitOutput(gitExecutable, cwd, args) {
-  return (await gitRawOutput(gitExecutable, cwd, args)).trim();
+async function gitOutput(gitExecutable, cwd, args, env) {
+  return (await gitRawOutput(gitExecutable, cwd, args, env)).trim();
 }
 
 function pathKey(value) {
@@ -514,6 +515,19 @@ async function gitSnapshot(run, gitExecutable) {
 
 function extractIds(text, prefix) {
   return [...new Set(text.match(new RegExp(`\\b${prefix}-\\d{3}\\b`, 'g')) ?? [])];
+}
+
+/**
+ * 사람이 승인하는 계약과 planner만 읽는 맥락을 한 파일 안에서 가른다.
+ * AC/CMD는 계약 섹션에서만 파싱하므로 맥락 산문은 자유롭게 쓸 수 있다.
+ * 계약 헤딩이 없는 SPEC은 전문이 계약이다 (기존 run 하위호환).
+ */
+function contractSection(specText) {
+  const heading = specText.match(/^\s{0,3}(#{1,6})\s*(?:계약|Contract)\s*$/im);
+  if (!heading) return specText;
+  const rest = specText.slice(heading.index + heading[0].length);
+  const next = rest.match(new RegExp(`^\\s{0,3}#{1,${heading[1].length}}\\s+\\S`, 'm'));
+  return next ? rest.slice(0, next.index) : rest;
 }
 
 function validateSpec(text) {
@@ -602,6 +616,14 @@ function validateReviewShape(review, expectedRound) {
     ) {
       throw new Error(`review finding ${finding.id} evidence is invalid`);
     }
+    // category is required in the schema (Codex strict structured output needs it declared),
+    // but older review JSON and fixtures predate it — accept missing, reject garbage.
+    if (
+      finding.category !== undefined &&
+      !['plan_defect', 'spec_defect'].includes(finding.category)
+    ) {
+      throw new Error(`review finding ${finding.id} category is invalid`);
+    }
   }
   for (const prior of review.prior_findings) {
     if (typeof prior?.id !== 'string' || !['resolved', 'open'].includes(prior.status)) {
@@ -624,46 +646,94 @@ function validateReviewShape(review, expectedRound) {
 }
 
 function evaluateReview(review, run, planText) {
+  // reasons(사람이 읽는 문자열)와 아래 네 배열(구조화된 detail)은 평행하다.
+  // reasons.push만 하고 대응하는 detail push를 빠뜨리면 lastError에는 보이는데
+  // lastErrorDetail에는 없는 항목이 생겨 두 뷰가 조용히 어긋난다.
   const reasons = [];
-  const blockingIds = [];
+  const planDefects = [];
+  const unresolvedPrior = [];
+  const failedAcceptance = [];
+  const blocking = new Map();
+
   const plan = validatePlan(planText, run);
-  if (!plan.valid) reasons.push(plan.reason);
+  if (!plan.valid) {
+    reasons.push(plan.reason);
+    planDefects.push(plan.reason);
+  }
 
   const priorById = new Map(review.prior_findings.map((item) => [item.id, item.status]));
   for (const id of run.previous_gate_blocking_ids) {
-    if (!priorById.has(id)) reasons.push(`previous finding ${id} was not reclassified`);
-    else if (priorById.get(id) === 'open') reasons.push(`previous finding ${id} remains open`);
+    if (!priorById.has(id)) {
+      reasons.push(`previous finding ${id} was not reclassified`);
+      unresolvedPrior.push({ id, status: 'unreclassified' });
+    } else if (priorById.get(id) === 'open') {
+      reasons.push(`previous finding ${id} remains open`);
+      unresolvedPrior.push({ id, status: 'open' });
+    }
   }
 
   for (const finding of review.findings) {
     const serious = finding.severity === 'blocker' || finding.severity === 'major';
-    if (serious || finding.needs_evidence) {
-      reasons.push(`finding ${finding.id} blocks approval`);
-      blockingIds.push(finding.id);
-    }
+    if (!serious && !finding.needs_evidence) continue;
+    reasons.push(`finding ${finding.id} blocks approval`);
+    blocking.set(finding.id, {
+      id: finding.id,
+      severity: finding.severity,
+      category: finding.category ?? 'plan_defect',
+      claim: finding.claim,
+      evidence: finding.evidence,
+    });
   }
 
   const checksById = new Map();
   for (const check of review.ac_checks) {
-    if (checksById.has(check.id)) reasons.push(`AC ${check.id} is duplicated`);
+    if (checksById.has(check.id)) {
+      reasons.push(`AC ${check.id} is duplicated`);
+      planDefects.push(`AC ${check.id} is duplicated`);
+    }
     checksById.set(check.id, check);
   }
   if (checksById.size !== run.spec.acceptance_ids.length) {
     reasons.push('AC checks do not exactly match the SPEC');
+    planDefects.push('AC checks do not exactly match the SPEC');
   }
   for (const id of run.spec.acceptance_ids) {
     const check = checksById.get(id);
-    if (!check) reasons.push(`AC ${id} is missing`);
-    else if (
+    if (!check) {
+      reasons.push(`AC ${id} is missing`);
+      failedAcceptance.push({ id, status: 'missing', reason: 'review omitted this AC' });
+    } else if (
       check.status !== 'pass' ||
       !check.implementation_ref?.trim() ||
       !check.verification_ref?.trim()
     ) {
       reasons.push(`AC ${id} is not fully mapped and passing`);
+      failedAcceptance.push({
+        id,
+        status: check.status,
+        reason: `implementation_ref=${check.implementation_ref || '(empty)'} verification_ref=${check.verification_ref || '(empty)'}`,
+      });
     }
   }
-  if (review.checkpoint_count < 1) reasons.push('at least one checkpoint is required');
-  return { ready: reasons.length === 0, reasons, blockingIds: [...new Set(blockingIds)] };
+  if (review.checkpoint_count < 1) {
+    reasons.push('at least one checkpoint is required');
+    planDefects.push('at least one checkpoint is required');
+  }
+
+  const blockingFindings = [...blocking.values()];
+  return {
+    ready: reasons.length === 0,
+    reasons,
+    blockingIds: [...blocking.keys()],
+    blockingFindings,
+    detail: {
+      blocking_findings: blockingFindings,
+      unresolved_prior_findings: unresolvedPrior,
+      failed_acceptance: failedAcceptance,
+      plan_defects: planDefects,
+      next_action: null,
+    },
+  };
 }
 
 async function readPolicy(harnessRoot) {
@@ -739,6 +809,60 @@ async function preflightVerificationCommands(specText, commandIds, options) {
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }
+  return commands;
+}
+
+/**
+ * base_sha 상태에서 각 CMD를 한 번 실행한다. 자동 거부는 하지 않고 결과만 남긴다.
+ * base에서 통과하는 CMD는 변경 전에도 통과한다는 뜻이므로, 사람이 승인 시점에
+ * "이 명령이 정말 이번 작업을 검증하나"를 판단할 근거가 된다.
+ *
+ * SPEC 계약상 CMD는 멱등·비파괴다. 그래도 워크트리를 더럽히는 명령이 있으면
+ * 갓 만든 worktree를 baseline으로 되돌리고 그 사실을 기록한다 — 안 되돌리면
+ * 이후 beginStep이 "writer worktree drifted"로 죽는다.
+ */
+async function probeVerificationCommands(commands, worktree, options) {
+  const results = [];
+  for (const { id, command } of commands) {
+    let exitCode = null;
+    let failure = null;
+    try {
+      const result = await options.processRunner({
+        ...verificationRequest(command, worktree, options.platform),
+        env: options.env,
+        timeoutMs: 5 * 60 * 1000,
+      });
+      exitCode = result.exitCode;
+    } catch (error) {
+      failure = error.message;
+    }
+    let mutated = false;
+    const status = await gitOutput(options.gitExecutable, worktree, [
+      'status', '--porcelain=v1', '-z',
+    ]);
+    if (status !== '') {
+      mutated = true;
+      await gitOutput(options.gitExecutable, worktree, ['reset', '--hard', 'HEAD']);
+      await gitOutput(options.gitExecutable, worktree, ['clean', '-fdq']);
+    }
+    results.push({ id, command, exit_code: exitCode, error: failure, mutated_worktree: mutated });
+  }
+  return results;
+}
+
+/**
+ * 계약 섹션에서 AC 줄과 같은 줄에 적힌 CMD 참조를 모은다.
+ * 판정 CMD가 없는 AC를 사람이 승인 전에 보게 하는 것이 목적이고, 강제하지 않는다.
+ */
+function acceptanceCoverage(contractText, acceptanceIds) {
+  const coverage = new Map(acceptanceIds.map((id) => [id, []]));
+  for (const line of contractText.split(/\r?\n/)) {
+    const matched = extractIds(line, 'AC').filter((id) => coverage.has(id));
+    if (matched.length === 0) continue;
+    const commandIds = extractIds(line, 'CMD');
+    for (const id of matched) coverage.get(id).push(...commandIds);
+  }
+  return acceptanceIds.map((id) => ({ id, command_ids: [...new Set(coverage.get(id))] }));
 }
 
 function normalizeProtectedPaths(values) {
@@ -928,6 +1052,7 @@ function verificationLog({
 
 async function stopForLockedInput(harnessRoot, run, label, detail) {
   run.last_error = `${label} locked digest changed${detail ? `: ${detail}` : ''}`;
+  run.last_error_detail = null;
   run.active_step = null;
   await setState(harnessRoot, run, 'NEEDS_HUMAN', 'locked_input', run.last_error);
   return false;
@@ -988,8 +1113,9 @@ async function initCommand(values, options) {
   const specPath = path.resolve(requireValue(values, 'spec'));
   const specBytes = await readFile(specPath);
   const specText = specBytes.toString('utf8');
-  const spec = validateSpec(specText);
-  await preflightVerificationCommands(specText, spec.commandIds, options);
+  const contract = contractSection(specText);
+  const spec = validateSpec(contract);
+  const commands = await preflightVerificationCommands(contract, spec.commandIds, options);
   const specSha = sha256Bytes(specBytes);
   const baseSha = await gitOutput(options.gitExecutable, repo, ['rev-parse', 'HEAD']);
   const inside = await gitOutput(options.gitExecutable, repo, ['rev-parse', '--is-inside-work-tree']);
@@ -1052,6 +1178,9 @@ async function initCommand(values, options) {
   const status = await gitOutput(options.gitExecutable, worktree, ['status', '--porcelain=v1', '-z']);
   if (status !== '') throw new Error('new writer worktree is not clean');
 
+  const commandBaseline = await probeVerificationCommands(commands, worktree, options);
+  const coverage = acceptanceCoverage(contract, spec.acceptanceIds);
+
   await atomicWrite(path.join(root, 'SPEC.md'), specBytes);
   let baseline = null;
   if (carryover) {
@@ -1077,6 +1206,8 @@ async function initCommand(values, options) {
     parent_run_id: carryover?.parent.run_id ?? null,
     prior_plan_review_rounds: carryover?.priorPlanReviewRounds ?? 0,
     baseline,
+    spec_command_baseline: commandBaseline,
+    spec_acceptance_coverage: coverage,
     state: 'PLAN_LOOP',
     repo_path: repo,
     worktree_path: worktree,
@@ -1098,6 +1229,7 @@ async function initCommand(values, options) {
     current_review_path: null,
     last_reviewed_plan_sha: null,
     previous_gate_blocking_ids: [],
+    previous_gate_round: null,
     cursor: {
       scout_attempted: 0,
       scout_status: 'pending',
@@ -1108,6 +1240,7 @@ async function initCommand(values, options) {
     },
     active_step: null,
     last_error: null,
+    last_error_detail: null,
     approved_plan_path: null,
     approved_plan_sha: null,
     approved_base_sha: null,
@@ -1115,6 +1248,12 @@ async function initCommand(values, options) {
   };
   await saveRun(options.harnessRoot, run);
   await event(options.harnessRoot, run, 'init', 'created');
+  await event(
+    options.harnessRoot,
+    run,
+    'spec_command_baseline',
+    commandBaseline.map(({ id, exit_code }) => `${id}=${exit_code}`).join(' '),
+  );
   return summarize(run);
 }
 
@@ -1137,6 +1276,9 @@ function summarize(run) {
     implementationDigest: run.implementation?.digest ?? null,
     verificationEvidence: run.implementation?.evidence_paths ?? [],
     lastError: run.last_error,
+    lastErrorDetail: run.last_error_detail ?? null,
+    specCommandBaseline: run.spec_command_baseline ?? [],
+    specAcceptanceCoverage: run.spec_acceptance_coverage ?? [],
   };
 }
 
@@ -1275,6 +1417,7 @@ async function beginStep(harnessRoot, run, type, round, inputs, gitExecutable) {
 async function recordStepFailure(harnessRoot, run, error) {
   const message = error instanceof Error ? error.message : String(error);
   run.last_error = message;
+  run.last_error_detail = null;
   if (run.active_step?.attempt >= 2) {
     const type = run.active_step.type;
     run.active_step = null;
@@ -1298,11 +1441,13 @@ async function writeProviderLogs(root, outputs, result) {
 async function finishStep(harnessRoot, run) {
   run.active_step = null;
   run.last_error = null;
+  run.last_error_detail = null;
   await saveRun(harnessRoot, run);
 }
 
 async function markBoundaryViolation(harnessRoot, run, type) {
   run.last_error = `${type} changed HEAD or worktree status`;
+  run.last_error_detail = null;
   run.active_step = null;
   await setState(harnessRoot, run, 'NEEDS_HUMAN', type, run.last_error);
 }
@@ -1677,7 +1822,27 @@ async function runPlanLoop(run, options) {
     const gate = evaluateReview(review, run, planText);
     if (gate.ready) {
       run.last_error = null;
+      run.last_error_detail = null;
       await setState(harnessRoot, run, 'AWAIT_PLAN_APPROVAL', 'plan_gate', 'ready');
+      break;
+    }
+    // A spec_defect can't be fixed by another revision round, so don't burn the
+    // revision budget on it — stop immediately and point the human at the SPEC.
+    const specDefects = gate.blockingFindings.filter(
+      (item) => item.category === 'spec_defect',
+    );
+    if (specDefects.length > 0) {
+      run.last_error = `SPEC defect blocks planning: ${
+        specDefects.map((item) => `${item.id} ${item.claim}`).join('; ')
+      }`;
+      // 같은 라운드에 계획 결함도 같이 있으면 그것도 보여준다. SPEC만 고치고 새 run을
+      // 시작한 사람이 못 본 채로 남아 있던 blocker를 다시 만나지 않게.
+      run.last_error_detail = {
+        ...gate.detail,
+        blocking_findings: specDefects,
+        next_action: 'blocking_findings[].evidence가 가리키는 SPEC 줄을 고치고 --parent-run으로 새 run을 시작한다',
+      };
+      await setState(harnessRoot, run, 'NEEDS_HUMAN', 'spec_gate', run.last_error);
       break;
     }
     const manualRoundComplete = run.human_revision_target_round !== null
@@ -1685,28 +1850,63 @@ async function runPlanLoop(run, options) {
     const lineageBudgetExhausted =
       (run.prior_plan_review_rounds ?? 0) + run.plan_review_round
       >= policy.budgets.lineage_plan_review_max;
-    if (
-      manualRoundComplete
-      || run.plan_review_round >= policy.budgets.plan_review_max
-      || lineageBudgetExhausted
-    ) {
-      run.last_error = [
-        ...gate.reasons,
-        ...(lineageBudgetExhausted ? ['lineage plan review budget exhausted'] : []),
-      ].join('; ');
+    // Round count is the wrong unit — a reviser that resolves findings should keep
+    // getting rounds, one that resolves nothing shouldn't burn more of them. Stall
+    // means: none of the ids blocking as of the *previous* round came back resolved.
+    // previous_gate_round < plan_review_round guards against a retried (failed)
+    // reviser call re-entering this same round's evaluation and comparing a round
+    // against itself.
+    const stalled = (run.previous_gate_round ?? null) !== null
+      && run.previous_gate_round < run.plan_review_round
+      && run.previous_gate_blocking_ids.length > 0
+      && !run.previous_gate_blocking_ids.some((id) =>
+        review.prior_findings.some((prior) => prior.id === id && prior.status === 'resolved'));
+    const stopReasons = [];
+    if (stalled) {
+      stopReasons.push(`plan review stalled at round ${run.plan_review_round}: no previous finding was resolved`);
+    }
+    if (run.plan_review_round >= policy.budgets.plan_review_max) {
+      stopReasons.push('plan review budget exhausted');
+    }
+    if (lineageBudgetExhausted) stopReasons.push('lineage plan review budget exhausted');
+    if (manualRoundComplete) stopReasons.push('requested human revision round is complete');
+    if (stopReasons.length > 0) {
+      run.last_error = [...stopReasons, ...gate.reasons].join('; ');
+      run.last_error_detail = {
+        ...gate.detail,
+        next_action: stalled
+          ? '리바이저가 수렴하지 않는다. SPEC을 고치거나 request-plan-revision으로 구체적인 지시를 준다'
+          : 'blocking_findings를 확인하고 request-plan-revision을 보내거나 --parent-run으로 새 run을 시작한다',
+      };
       await setState(harnessRoot, run, 'NEEDS_HUMAN', 'plan_gate', run.last_error);
       break;
     }
     run.previous_gate_blocking_ids = gate.blockingIds;
+    run.previous_gate_round = run.plan_review_round;
     await saveRun(harnessRoot, run);
+    const shaBeforeRevision = run.current_plan_sha;
     await callReviser(harnessRoot, run, review, providerRunner, gitExecutable);
     run = await loadRun(harnessRoot, run.run_id);
+    // 리바이저가 바이트 동일한 계획을 돌려주면 리뷰어를 건너뛰어 라운드가 오르지 않는다.
+    // 그러면 stall 룰도 라운드 예산도 영영 발동하지 못한 채 유료 호출만 반복된다.
+    // callReviser의 실패 경로는 전부 던지거나(첫 시도) NEEDS_HUMAN으로 끝나므로,
+    // 여기서 PLAN_LOOP이면서 SHA가 그대로면 "성공했는데 안 바뀐" 경우뿐이다.
+    if (run.state === 'PLAN_LOOP' && run.current_plan_sha === shaBeforeRevision) {
+      run.last_error = `plan review stalled at round ${run.plan_review_round}: reviser returned an unchanged plan`;
+      run.last_error_detail = {
+        ...gate.detail,
+        next_action: '리바이저가 수렴하지 않는다. SPEC을 고치거나 request-plan-revision으로 구체적인 지시를 준다',
+      };
+      await setState(harnessRoot, run, 'NEEDS_HUMAN', 'plan_gate', run.last_error);
+      break;
+    }
   }
   return summarize(await loadRun(harnessRoot, run.run_id));
 }
 
 async function stopImplementation(harnessRoot, run, message, action = 'implementation_gate') {
   run.last_error = message;
+  run.last_error_detail = null;
   run.active_step = null;
   await setState(harnessRoot, run, 'NEEDS_HUMAN', action, message);
   return summarize(run);
@@ -1743,7 +1943,7 @@ async function runImplementationLoop(run, options) {
   let protectedPaths;
   let protectedDigests;
   try {
-    verificationCommands = parseVerificationCommands(specText, run.spec.command_ids);
+    verificationCommands = parseVerificationCommands(contractSection(specText), run.spec.command_ids);
     protectedPaths = normalizeProtectedPaths((await readPolicy(harnessRoot)).protected_paths);
     protectedDigests = await protectedPathDigests(run.worktree_path, protectedPaths);
   } catch (error) {
@@ -1862,79 +2062,117 @@ async function runImplementationLoop(run, options) {
   await saveRun(harnessRoot, run);
 
   let expectedSnapshot = await gitSnapshot(run, gitExecutable);
-  for (const verification of verificationCommands) {
-    const startedAt = new Date().toISOString();
-    let commandResult;
-    try {
-      commandResult = await processRunner({
-        ...verificationRequest(verification.command, run.worktree_path, platform),
-        env: options.env,
-      });
-    } catch (error) {
-      commandResult = { exitCode: 5, stdout: '', stderr: error.message };
+  // locked CMD는 워킹트리에서 돌지만 구현 산출물은 전부 untracked다 (implementer는
+  // stage 금지). 그래서 git grep / ls-files / diff HEAD가 조용히 빈 집합을 본다.
+  // 버릴 인덱스에 산출물을 넣어 CMD에만 건네고, 실제 인덱스는 그대로 둔다.
+  //
+  // 한계: GIT_INDEX_FILE에는 저장소 범위가 없다. 이 환경변수를 물려받은 CMD가
+  // 다른 git 저장소를 만들거나 조작하면 그 저장소가 이 인덱스를 그대로 쓰게 되고,
+  // 여기 담긴 blob이 저쪽 object DB에는 없어서 "invalid object ... / error: Error
+  // building trees"로 죽는다. 그래서 검증 명령은 다른 git 저장소를 만들거나
+  // 조작하면 안 된다 (SPEC.example.md·SKILL·README에 같은 제약을 적어 뒀다).
+  //
+  // 인덱스는 명령마다가 아니라 루프 전에 한 번만 만든다. 워크트리를 바꾸는 명령은
+  // 아래 verificationChangedWorktree에서 루프를 중단시키므로 인덱스가 낡은 채로
+  // 다음 명령에 넘어가는 경우가 없다.
+  const indexDirectory = await mkdtemp(path.join(tmpdir(), 'agent-harness-index-'));
+  const verificationEnv = {
+    ...options.env,
+    GIT_INDEX_FILE: path.join(indexDirectory, 'index'),
+  };
+  try {
+    // read-tree를 먼저 하지 않으면 .gitignore에 매칭되는 tracked 파일이
+    // add -A 뒤 "삭제"로 보인다.
+    await gitOutput(gitExecutable, run.worktree_path, ['read-tree', 'HEAD'], verificationEnv);
+    await gitOutput(gitExecutable, run.worktree_path, ['add', '-A'], verificationEnv);
+  } catch (error) {
+    await rm(indexDirectory, { recursive: true, force: true });
+    return stopImplementation(
+      harnessRoot,
+      run,
+      `verification index could not be built: ${error.message}`,
+      'verification',
+    );
+  }
+  try {
+    for (const verification of verificationCommands) {
+      const startedAt = new Date().toISOString();
+      let commandResult;
+      try {
+        commandResult = await processRunner({
+          ...verificationRequest(verification.command, run.worktree_path, platform),
+          env: verificationEnv,
+        });
+      } catch (error) {
+        commandResult = { exitCode: 5, stdout: '', stderr: error.message };
+      }
+      const finishedAt = new Date().toISOString();
+      let after;
+      let inspectionError = '';
+      try {
+        after = await gitSnapshot(run, gitExecutable);
+      } catch (error) {
+        inspectionError = error.message;
+        after = { head: 'unavailable', status_hash: null };
+      }
+      const evidencePath = `evidence/${verification.id}.log`;
+      await atomicWrite(path.join(root, evidencePath), verificationLog({
+        id: verification.id,
+        command: verification.command,
+        cwd: run.worktree_path,
+        result: commandResult,
+        startedAt,
+        finishedAt,
+        headSha: after.head,
+        inspectionError,
+      }));
+      run.implementation.evidence_paths.push(evidencePath);
+      await saveRun(harnessRoot, run);
+      if (inspectionError) {
+        return stopImplementation(
+          harnessRoot,
+          run,
+          `${verification.id} inspection failed: ${inspectionError}`,
+          'verification',
+        );
+      }
+      if (commandResult.exitCode !== 0) {
+        return stopImplementation(
+          harnessRoot,
+          run,
+          `${verification.id} exited with code ${commandResult.exitCode}`,
+          'verification',
+        );
+      }
+      let verificationChangedWorktree =
+        after.head !== expectedSnapshot.head || after.status_hash !== expectedSnapshot.status_hash;
+      try {
+        const afterProtected = await protectedPathDigests(run.worktree_path, protectedPaths);
+        const afterChanges = await implementationPaths(run, gitExecutable);
+        const afterManifest = await implementationManifest(run, afterChanges.paths);
+        const afterDigest = sha256Bytes(Buffer.from(`${JSON.stringify(afterManifest, null, 2)}\n`));
+        verificationChangedWorktree ||= protectedPaths.some(
+          (relative) => afterProtected[relative] !== protectedDigests[relative],
+        );
+        // 이제 CMD의 git add는 버릴 인덱스로 가므로 이 검사에 걸리지 않는다.
+        // 실제 인덱스가 더럽혀졌다는 뜻(= 다른 경로로 스테이징됐다)일 때만 걸린다.
+        verificationChangedWorktree ||= (await stagedPaths(run, gitExecutable)).length > 0;
+        verificationChangedWorktree ||= afterDigest !== implementationDigest;
+      } catch {
+        verificationChangedWorktree = true;
+      }
+      if (verificationChangedWorktree) {
+        return stopImplementation(
+          harnessRoot,
+          run,
+          `${verification.id} changed HEAD or worktree status`,
+          'verification',
+        );
+      }
+      expectedSnapshot = after;
     }
-    const finishedAt = new Date().toISOString();
-    let after;
-    let inspectionError = '';
-    try {
-      after = await gitSnapshot(run, gitExecutable);
-    } catch (error) {
-      inspectionError = error.message;
-      after = { head: 'unavailable', status_hash: null };
-    }
-    const evidencePath = `evidence/${verification.id}.log`;
-    await atomicWrite(path.join(root, evidencePath), verificationLog({
-      id: verification.id,
-      command: verification.command,
-      cwd: run.worktree_path,
-      result: commandResult,
-      startedAt,
-      finishedAt,
-      headSha: after.head,
-      inspectionError,
-    }));
-    run.implementation.evidence_paths.push(evidencePath);
-    await saveRun(harnessRoot, run);
-    if (inspectionError) {
-      return stopImplementation(
-        harnessRoot,
-        run,
-        `${verification.id} inspection failed: ${inspectionError}`,
-        'verification',
-      );
-    }
-    if (commandResult.exitCode !== 0) {
-      return stopImplementation(
-        harnessRoot,
-        run,
-        `${verification.id} exited with code ${commandResult.exitCode}`,
-        'verification',
-      );
-    }
-    let verificationChangedWorktree =
-      after.head !== expectedSnapshot.head || after.status_hash !== expectedSnapshot.status_hash;
-    try {
-      const afterProtected = await protectedPathDigests(run.worktree_path, protectedPaths);
-      const afterChanges = await implementationPaths(run, gitExecutable);
-      const afterManifest = await implementationManifest(run, afterChanges.paths);
-      const afterDigest = sha256Bytes(Buffer.from(`${JSON.stringify(afterManifest, null, 2)}\n`));
-      verificationChangedWorktree ||= protectedPaths.some(
-        (relative) => afterProtected[relative] !== protectedDigests[relative],
-      );
-      verificationChangedWorktree ||= (await stagedPaths(run, gitExecutable)).length > 0;
-      verificationChangedWorktree ||= afterDigest !== implementationDigest;
-    } catch {
-      verificationChangedWorktree = true;
-    }
-    if (verificationChangedWorktree) {
-      return stopImplementation(
-        harnessRoot,
-        run,
-        `${verification.id} changed HEAD or worktree status`,
-        'verification',
-      );
-    }
-    expectedSnapshot = after;
+  } finally {
+    await rm(indexDirectory, { recursive: true, force: true });
   }
 
   run.head_sha = expectedSnapshot.head;
@@ -1984,11 +2222,13 @@ async function requestPlanRevision(values, options) {
   const planText = await readFile(path.join(root, run.current_plan_path), 'utf8');
   const gate = evaluateReview(review, run, planText);
   run.previous_gate_blocking_ids = gate.blockingIds;
+  run.previous_gate_round = run.plan_review_round;
   run.human_plan_revision_count = sequence;
   run.human_revision_target_round = run.plan_review_round + 1;
   run.pending_human_plan_revision_path = relative;
   run.latest_human_plan_revision_path = relative;
   run.last_error = null;
+  run.last_error_detail = null;
   await setState(options.harnessRoot, run, 'PLAN_LOOP', 'request_plan_revision', relative);
   return summarize(run);
 }
@@ -2020,6 +2260,7 @@ async function abortRun(values, options) {
   if (CLOSED_RUN_STATES.has(run.state)) throw new Error('run is already closed');
   const reason = requireValue(values, 'reason');
   run.last_error = reason;
+  run.last_error_detail = null;
   run.active_step = null;
   await setState(options.harnessRoot, run, 'ABORTED', 'abort', reason);
   return summarize(run);
