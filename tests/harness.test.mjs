@@ -915,6 +915,59 @@ test('a second blocked review stops at NEEDS_HUMAN without a third call', async 
   assert.equal(scripted.queue.length, 0);
 });
 
+test('a blocking spec_defect stops the loop immediately at spec_gate', async (t) => {
+  const f = await fixture(t);
+  const specDefect = {
+    ...finding('F-001'),
+    severity: 'blocker',
+    category: 'spec_defect',
+    evidence: ['SPEC 계약: CMD-001: `git grep -q deploy`'],
+  };
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    { step: 'codex_plan_review', result: { review: review(1, { findings: [specDefect] }) } },
+  ]);
+  const created = await initRun(f, scripted.providerRunner);
+  const result = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+  const events = (await readFile(
+    path.join(f.harnessRoot, '.harness', 'runs', created.runId, 'events.jsonl'),
+    'utf8',
+  )).trim().split('\n').map((line) => JSON.parse(line));
+
+  assert.equal(result.state, 'NEEDS_HUMAN');
+  assert.equal(scripted.queue.length, 0, '리바이저를 호출하지 않는다');
+  assert.match(result.lastError, /SPEC/i);
+  assert.ok(events.some(({ action }) => action === 'spec_gate'));
+  assert.equal(result.lastErrorDetail.blocking_findings[0].category, 'spec_defect');
+  assert.match(result.lastErrorDetail.blocking_findings[0].evidence[0], /CMD-001/);
+});
+
+test('a finding without a category is treated as a plan defect', async (t) => {
+  const f = await fixture(t);
+  const scripted = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan: planV1 } },
+    { step: 'codex_plan_review', result: { review: review(1, { findings: [finding()] }) } },
+    { step: 'claude_plan_revise', result: { plan: planV2, decision: 'F-001: incorporated' } },
+    {
+      step: 'codex_plan_review',
+      result: { review: review(2, { prior: [{ id: 'F-001', status: 'resolved' }] }) },
+    },
+  ]);
+  const created = await initRun(f, scripted.providerRunner);
+  const result = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: scripted.providerRunner,
+  });
+
+  assert.equal(result.state, 'AWAIT_PLAN_APPROVAL');
+  assert.equal(scripted.queue.length, 0);
+});
+
 test('approve-plan accepts only the exact current plan digest', async (t) => {
   const f = await fixture(t);
   const { created, providerRunner } = await runToApproval(f);

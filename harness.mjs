@@ -616,6 +616,14 @@ function validateReviewShape(review, expectedRound) {
     ) {
       throw new Error(`review finding ${finding.id} evidence is invalid`);
     }
+    // category is required in the schema (Codex strict structured output needs it declared),
+    // but older review JSON and fixtures predate it — accept missing, reject garbage.
+    if (
+      finding.category !== undefined &&
+      !['plan_defect', 'spec_defect'].includes(finding.category)
+    ) {
+      throw new Error(`review finding ${finding.id} category is invalid`);
+    }
   }
   for (const prior of review.prior_findings) {
     if (typeof prior?.id !== 'string' || !['resolved', 'open'].includes(prior.status)) {
@@ -639,7 +647,6 @@ function validateReviewShape(review, expectedRound) {
 
 function evaluateReview(review, run, planText) {
   const reasons = [];
-  const blockingIds = [];
   const plan = validatePlan(planText, run);
   if (!plan.valid) reasons.push(plan.reason);
 
@@ -649,12 +656,18 @@ function evaluateReview(review, run, planText) {
     else if (priorById.get(id) === 'open') reasons.push(`previous finding ${id} remains open`);
   }
 
+  const blocking = new Map();
   for (const finding of review.findings) {
     const serious = finding.severity === 'blocker' || finding.severity === 'major';
-    if (serious || finding.needs_evidence) {
-      reasons.push(`finding ${finding.id} blocks approval`);
-      blockingIds.push(finding.id);
-    }
+    if (!serious && !finding.needs_evidence) continue;
+    reasons.push(`finding ${finding.id} blocks approval`);
+    blocking.set(finding.id, {
+      id: finding.id,
+      severity: finding.severity,
+      category: finding.category ?? 'plan_defect',
+      claim: finding.claim,
+      evidence: finding.evidence,
+    });
   }
 
   const checksById = new Map();
@@ -677,7 +690,12 @@ function evaluateReview(review, run, planText) {
     }
   }
   if (review.checkpoint_count < 1) reasons.push('at least one checkpoint is required');
-  return { ready: reasons.length === 0, reasons, blockingIds: [...new Set(blockingIds)] };
+  return {
+    ready: reasons.length === 0,
+    reasons,
+    blockingIds: [...blocking.keys()],
+    blockingFindings: [...blocking.values()],
+  };
 }
 
 async function readPolicy(harnessRoot) {
@@ -1217,6 +1235,7 @@ function summarize(run) {
     implementationDigest: run.implementation?.digest ?? null,
     verificationEvidence: run.implementation?.evidence_paths ?? [],
     lastError: run.last_error,
+    lastErrorDetail: run.last_error_detail ?? null,
     specCommandBaseline: run.spec_command_baseline ?? [],
     specAcceptanceCoverage: run.spec_acceptance_coverage ?? [],
   };
@@ -1760,6 +1779,25 @@ async function runPlanLoop(run, options) {
     if (gate.ready) {
       run.last_error = null;
       await setState(harnessRoot, run, 'AWAIT_PLAN_APPROVAL', 'plan_gate', 'ready');
+      break;
+    }
+    // A spec_defect can't be fixed by another revision round, so don't burn the
+    // revision budget on it — stop immediately and point the human at the SPEC.
+    const specDefects = gate.blockingFindings.filter(
+      (item) => item.category === 'spec_defect',
+    );
+    if (specDefects.length > 0) {
+      run.last_error = `SPEC defect blocks planning: ${
+        specDefects.map((item) => `${item.id} ${item.claim}`).join('; ')
+      }`;
+      run.last_error_detail = {
+        blocking_findings: specDefects,
+        unresolved_prior_findings: [],
+        failed_acceptance: [],
+        plan_defects: [],
+        next_action: 'blocking_findings[].evidence가 가리키는 SPEC 줄을 고치고 --parent-run으로 새 run을 시작한다',
+      };
+      await setState(harnessRoot, run, 'NEEDS_HUMAN', 'spec_gate', run.last_error);
       break;
     }
     const manualRoundComplete = run.human_revision_target_round !== null
