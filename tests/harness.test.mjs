@@ -273,16 +273,17 @@ test('tracked pingpong skill connects a task to the public plan runner', async (
   assert.match(skill, /^disable-model-invocation: true$/m);
   assert.match(skill, /\$ARGUMENTS/);
   assert.match(skill, /무슨 작업을 계획할까요\?/);
-  assert.match(skill, /harness\.mjs"?\s+start --repo/);
+  assert.match(skill, /harness\.mjs"?\s+init --repo/);
+  assert.match(skill, /harness\.mjs"?\s+run --run/);
   assert.match(skill, /pingpong resume/);
   assert.match(skill, /사용자가 명시한 저장소.*현재 Git root.*다르면/s);
   assert.match(skill, /\$env:TEMP/);
   assert.doesNotMatch(skill, /\.harness\/inputs/);
   assert.match(skill, /\.harness\/runs\/<runId>\/<currentPlanPath>/);
   assert.match(skill, /최종 SPEC 요약/);
-  assert.match(skill, /명시적 승인.*전에는.*harness\.mjs.*start/s);
+  assert.match(skill, /명시적 승인.*전에는.*harness\.mjs.*init/s);
   assert.match(skill, /명시적 승인.*전에는.*Cursor Scout.*provider.*subagent.*호출하지 않는다/s);
-  assert.match(skill, /최종 SPEC 요약.*명시적 승인.*승인 뒤.*harness\.mjs.*start/s);
+  assert.match(skill, /최종 SPEC 요약.*명시적 승인.*승인 뒤.*harness\.mjs.*init/s);
   assert.match(skill, /수정.*SPEC.*다시.*승인/s);
   assert.match(skill, /계획을 바꾸는 미확정 맥락.*한 번에 하나씩/s);
   assert.match(skill, /현재 코드에서 답을 확인할 수 있으면.*묻지 않는다/s);
@@ -294,6 +295,11 @@ test('tracked pingpong skill connects a task to the public plan runner', async (
   assert.match(skill, /멱등.*비파괴/);
   assert.match(skill, /specCommandBaseline/);
   assert.match(skill, /specAcceptanceCoverage/);
+  assert.match(skill, /`exit_code`가 `null`/);
+  assert.match(skill, /다른 git 저장소/);
+  // baseline 보고는 provider에 돈을 쓰기 전에 온다: init --repo → baseline → run --run.
+  assert.ok(newWork.indexOf('init --repo') < newWork.indexOf('specCommandBaseline'));
+  assert.ok(newWork.indexOf('specCommandBaseline') < newWork.indexOf('run --run'));
   assert.match(skill, /사용자 말과 현재 코드가 어긋나면.*묻는다/s);
   assert.match(skill, /lastErrorDetail/);
   assert.match(newWork, /새 작업 진입 시점부터.*명시적 승인.*Cursor Scout.*provider.*subagent.*호출하지 않는다/s);
