@@ -756,6 +756,59 @@ async function preflightVerificationCommands(specText, commandIds, options) {
   return commands;
 }
 
+/**
+ * base_sha 상태에서 각 CMD를 한 번 실행한다. 자동 거부는 하지 않고 결과만 남긴다.
+ * base에서 통과하는 CMD는 변경 전에도 통과한다는 뜻이므로, 사람이 승인 시점에
+ * "이 명령이 정말 이번 작업을 검증하나"를 판단할 근거가 된다.
+ *
+ * SPEC 계약상 CMD는 멱등·비파괴다. 그래도 워크트리를 더럽히는 명령이 있으면
+ * 갓 만든 worktree를 baseline으로 되돌리고 그 사실을 기록한다 — 안 되돌리면
+ * 이후 beginStep이 "writer worktree drifted"로 죽는다.
+ */
+async function probeVerificationCommands(commands, worktree, options) {
+  const results = [];
+  for (const { id, command } of commands) {
+    let exitCode = null;
+    let failure = null;
+    try {
+      const result = await options.processRunner({
+        ...verificationRequest(command, worktree, options.platform),
+        env: options.env,
+        timeoutMs: 5 * 60 * 1000,
+      });
+      exitCode = result.exitCode;
+    } catch (error) {
+      failure = error.message;
+    }
+    let mutated = false;
+    const status = await gitOutput(options.gitExecutable, worktree, [
+      'status', '--porcelain=v1', '-z',
+    ]);
+    if (status !== '') {
+      mutated = true;
+      await gitOutput(options.gitExecutable, worktree, ['reset', '--hard', 'HEAD']);
+      await gitOutput(options.gitExecutable, worktree, ['clean', '-fdq']);
+    }
+    results.push({ id, command, exit_code: exitCode, error: failure, mutated_worktree: mutated });
+  }
+  return results;
+}
+
+/**
+ * 계약 섹션에서 AC 줄과 같은 줄에 적힌 CMD 참조를 모은다.
+ * 판정 CMD가 없는 AC를 사람이 승인 전에 보게 하는 것이 목적이고, 강제하지 않는다.
+ */
+function acceptanceCoverage(contractText, acceptanceIds) {
+  const coverage = new Map(acceptanceIds.map((id) => [id, []]));
+  for (const line of contractText.split(/\r?\n/)) {
+    const matched = extractIds(line, 'AC').filter((id) => coverage.has(id));
+    if (matched.length === 0) continue;
+    const commandIds = extractIds(line, 'CMD');
+    for (const id of matched) coverage.get(id).push(...commandIds);
+  }
+  return acceptanceIds.map((id) => ({ id, command_ids: [...new Set(coverage.get(id))] }));
+}
+
 function normalizeProtectedPaths(values) {
   if (!Array.isArray(values) || values.length === 0) {
     throw new Error('policy.protected_paths must be a non-empty array');
@@ -1068,6 +1121,9 @@ async function initCommand(values, options) {
   const status = await gitOutput(options.gitExecutable, worktree, ['status', '--porcelain=v1', '-z']);
   if (status !== '') throw new Error('new writer worktree is not clean');
 
+  const commandBaseline = await probeVerificationCommands(commands, worktree, options);
+  const coverage = acceptanceCoverage(contract, spec.acceptanceIds);
+
   await atomicWrite(path.join(root, 'SPEC.md'), specBytes);
   let baseline = null;
   if (carryover) {
@@ -1093,6 +1149,8 @@ async function initCommand(values, options) {
     parent_run_id: carryover?.parent.run_id ?? null,
     prior_plan_review_rounds: carryover?.priorPlanReviewRounds ?? 0,
     baseline,
+    spec_command_baseline: commandBaseline,
+    spec_acceptance_coverage: coverage,
     state: 'PLAN_LOOP',
     repo_path: repo,
     worktree_path: worktree,
@@ -1131,6 +1189,12 @@ async function initCommand(values, options) {
   };
   await saveRun(options.harnessRoot, run);
   await event(options.harnessRoot, run, 'init', 'created');
+  await event(
+    options.harnessRoot,
+    run,
+    'spec_command_baseline',
+    commandBaseline.map(({ id, exit_code }) => `${id}=${exit_code}`).join(' '),
+  );
   return summarize(run);
 }
 
@@ -1153,6 +1217,8 @@ function summarize(run) {
     implementationDigest: run.implementation?.digest ?? null,
     verificationEvidence: run.implementation?.evidence_paths ?? [],
     lastError: run.last_error,
+    specCommandBaseline: run.spec_command_baseline ?? [],
+    specAcceptanceCoverage: run.spec_acceptance_coverage ?? [],
   };
 }
 

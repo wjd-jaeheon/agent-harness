@@ -688,6 +688,57 @@ test('init creates a durable PLAN_LOOP run without provider calls', async (t) =>
   assert.deepEqual(scripted.calls, []);
 });
 
+test('init runs every CMD at base_sha and reports the result', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    f.specPath,
+    [
+      '# Toy SPEC',
+      '',
+      '## 계약',
+      '',
+      '- AC-001: app.txt가 그대로다 — 검증: CMD-001',
+      '- AC-002: 새 파일이 생긴다 — 검증: 수동',
+      '- CMD-001: `node --version`',
+      '- CMD-002: `git ls-files --error-unmatch new.txt`',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+  const { providerRunner } = scriptedProvider([]);
+  const created = await initRun(f, providerRunner);
+  const run = await readRun(f.harnessRoot, created.runId);
+
+  assert.deepEqual(
+    run.spec_command_baseline.map(({ id, exit_code }) => [id, exit_code]),
+    [['CMD-001', 0], ['CMD-002', 1]],
+  );
+  assert.deepEqual(created.specCommandBaseline, run.spec_command_baseline);
+  assert.deepEqual(run.spec_acceptance_coverage, [
+    { id: 'AC-001', command_ids: ['CMD-001'] },
+    { id: 'AC-002', command_ids: [] },
+  ]);
+  assert.equal(await git(run.worktree_path, 'status', '--porcelain'), '');
+});
+
+test('a CMD that dirties the baseline worktree is restored and flagged', async (t) => {
+  const f = await fixture(t);
+  const dirty = process.platform === 'win32'
+    ? 'Set-Content -Path probe.txt -Value x'
+    : 'printf x > probe.txt';
+  await writeFile(
+    f.specPath,
+    `# Toy SPEC\n\nAC-001: update app\n\nCMD-001: \`${dirty}\`\n`,
+    'utf8',
+  );
+  const { providerRunner } = scriptedProvider([]);
+  const created = await initRun(f, providerRunner);
+  const run = await readRun(f.harnessRoot, created.runId);
+
+  assert.equal(run.spec_command_baseline[0].mutated_worktree, true);
+  assert.equal(await git(run.worktree_path, 'status', '--porcelain'), '');
+});
+
 test('full two-review plan loop reaches AWAIT_PLAN_APPROVAL with durable artifacts', async (t) => {
   const f = await fixture(t);
   const { created, result, calls, queue } = await runToApproval(f);
