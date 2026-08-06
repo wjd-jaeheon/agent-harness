@@ -202,6 +202,61 @@ test('계약 섹션이 없는 SPEC은 전문에서 그대로 파싱된다', asyn
   assert.deepEqual(run.spec.command_ids, ['CMD-001']);
 });
 
+test('계약 섹션 안의 하위 소제목은 경계가 아니고, 형제 헤딩만 경계다', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    f.specPath,
+    [
+      '# Toy SPEC',
+      '',
+      '## 계약',
+      '',
+      '### 수용 조건',
+      '',
+      '- AC-001: update app — 검증: CMD-001',
+      '',
+      '### 필수 검증 명령',
+      '',
+      '- CMD-001: `node --version`',
+      '',
+      '## 맥락',
+      '',
+      'CMD-004는 여기서만 언급된다. AC-009도 마찬가지다.',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+  const { providerRunner } = scriptedProvider([]);
+  const created = await initRun(f, providerRunner);
+  const run = await readRun(f.harnessRoot, created.runId);
+
+  assert.deepEqual(run.spec.acceptance_ids, ['AC-001']);
+  assert.deepEqual(run.spec.command_ids, ['CMD-001']);
+});
+
+test('계약 섹션이 파일의 마지막 섹션이어도(뒤따르는 헤딩이 없어도) 파싱된다', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    f.specPath,
+    [
+      '# Toy SPEC',
+      '',
+      '## 계약',
+      '',
+      '- AC-001: update app — 검증: CMD-001',
+      '- CMD-001: `node --version`',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+  const { providerRunner } = scriptedProvider([]);
+  const created = await initRun(f, providerRunner);
+  const run = await readRun(f.harnessRoot, created.runId);
+
+  assert.deepEqual(run.spec.acceptance_ids, ['AC-001']);
+  assert.deepEqual(run.spec.command_ids, ['CMD-001']);
+});
+
 test('launcher approval maps to one exact approve-plan command', async () => {
   assert.deepEqual(actionArgv('approve', { runId: 'r1', currentPlanSha: 'a'.repeat(64) }), [
     'approve-plan', '--run', 'r1', '--plan-sha', 'a'.repeat(64),
