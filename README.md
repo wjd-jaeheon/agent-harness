@@ -82,6 +82,10 @@ node .\harness.mjs init `
   --spec "D:\path\to\SPEC.md"
 ```
 
+`init`은 새 worktree를 base_sha로 만든 뒤 SPEC 계약 섹션의 `CMD-###`를 **거기서 한 번 실행한다**. 결과는 `specCommandBaseline`에, `AC-###`별 판정 명령은 `specAcceptanceCoverage`에 담겨 나온다. base에서 통과하는 CMD는 변경 전에도 통과한다는 뜻이므로 이번 작업을 판정하지 못할 수 있다. 자동 거부는 하지 않으니 사람이 보고 판단한다.
+
+검증 명령은 멱등·비파괴여야 한다. runner가 base_sha에서 한 번, 구현 뒤에 또 한 번 실행하기 때문이다. 배포·마이그레이션은 검증이 아니라 작업이다.
+
 출력의 `runId`를 복사한다. 이후 모든 명령은 이 ID를 명시한다.
 
 ```powershell
@@ -94,7 +98,7 @@ node .\harness.mjs status --run $run
 
 - `AWAIT_PLAN_APPROVAL`: 계획 검토 가능
 - `READY_FOR_MANUAL_MERGE`: 구현 diff와 필수 검증 통과
-- `NEEDS_HUMAN`: 예산 소진 또는 경계 위반. `lastError` 확인
+- `NEEDS_HUMAN`: 수렴 정지, 예산 소진, 경계 위반, 또는 SPEC 결함. `lastError`와 `lastErrorDetail.next_action` 확인
 
 ## 5. 계획 읽고 결정
 
@@ -161,7 +165,7 @@ node .\harness.mjs run --run $run
 ## 현재 한계
 
 - checkpoint별 Claude 코드 리뷰·Codex fix 루프는 아직 없다.
-- verification command는 SPEC에서 `CMD-001: \`실행할 명령\`` 형식이어야 한다.
+- verification command는 SPEC `## 계약` 섹션에서 `CMD-001: \`실행할 명령\`` 형식이어야 한다. `## 맥락` 섹션의 언급은 파싱되지 않는다.
 - GitHub 자동 병합은 없다. 최종 병합은 사람이 한다.
 - Orca orchestration은 쓰지 않는다.
 - Cursor 독립 감사는 아직 없다.

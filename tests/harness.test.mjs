@@ -290,6 +290,12 @@ test('tracked pingpong skill connects a task to the public plan runner', async (
   assert.match(skill, /runner.*상태 전이/s);
   assert.match(skill, /cursorScoutUnavailableReason.*보여/s);
   assert.match(skill, /--parent-run "<이전 runId>"/);
+  assert.match(skill, /## 계약[\s\S]*## 맥락/);
+  assert.match(skill, /멱등.*비파괴/);
+  assert.match(skill, /specCommandBaseline/);
+  assert.match(skill, /specAcceptanceCoverage/);
+  assert.match(skill, /사용자 말과 현재 코드가 어긋나면.*묻는다/s);
+  assert.match(skill, /lastErrorDetail/);
   assert.match(newWork, /새 작업 진입 시점부터.*명시적 승인.*Cursor Scout.*provider.*subagent.*호출하지 않는다/s);
   assert.ok(newWork.indexOf('새 작업 진입 시점부터') < newWork.indexOf('1. 현재 Git root'));
   assert.doesNotMatch(newWork, /launcher\.mjs/);
