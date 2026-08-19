@@ -234,26 +234,26 @@ SPEC의 수용조건 자체가 바뀌는 요청은 계획 보완이 아니다. �
 1. runner가 승인된 PLAN의 checkpoint를 순서대로 Codex에 전달한다.
 2. Codex는 writer worktree에서 해당 checkpoint만 구현하고 source를 직접 commit하지 않는다.
 3. runner가 실제 변경 경로를 checkpoint의 승인 경로와 비교한다.
-4. 범위 밖 변경이 있으면 stage하지 않고 NEEDS_HUMAN으로 간다.
+4. 범위 밖 변경이 있으면 NEEDS_HUMAN으로 간다.
 5. runner가 해당 checkpoint의 CMD를 실행하고 로그를 evidence에 저장한다.
-6. 성공하면 승인 경로만 명시적으로 stage하고 checkpoint commit을 만든다.
+6. 성공하면 checkpoint diff·manifest·evidence를 파일 원장에 저장한다.
 7. runner가 Claude에 checkpoint diff, PLAN, SPEC, evidence 원문을 전달한다.
 8. Claude는 finding과 Codex용 재구현 지시를 반환한다.
 9. blocker/major가 있으면 Codex가 accepted/rejected 사유를 남기고 재구현한다.
-10. runner가 테스트, 새 checkpoint commit, Claude 재검토를 수행한다.
+10. runner가 테스트, 갱신된 checkpoint diff 저장, Claude 재검토를 수행한다.
 11. 해당 checkpoint gate가 통과하면 다음 checkpoint로 간다.
 
-작은 변경은 PLAN에서 하나의 checkpoint로 묶는다. 모든 임의 commit마다 리뷰하지 않고, PLAN에 정의된 논리적 checkpoint commit에서만 Claude 리뷰를 실행한다.
+작은 변경은 PLAN에서 하나의 checkpoint로 묶는다. source는 최종 사람 검토 전까지 commit하지 않고, PLAN에 정의된 논리적 checkpoint에서만 Claude 리뷰를 실행한다.
 
 ### C. 최종 교차 검증
 
-1. 모든 checkpoint 완료 뒤 runner가 SPEC의 필수 명령 전체를 current head SHA에서 실행한다.
-2. Claude가 base..head 전체 diff, 최종 PLAN, 모든 review·decision·evidence를 검토한다.
+1. 모든 checkpoint 완료 뒤 runner가 SPEC의 필수 명령 전체를 현재 worktree에서 실행한다.
+2. Claude가 base 대비 전체 worktree diff, 최종 PLAN, 모든 review·decision·evidence를 검토한다.
 3. Codex가 Claude finding마다 수용·거절과 근거를 남기고 accepted finding을 수정한다.
-4. 새 commit이 생기면 기존 테스트·리뷰 evidence를 stale 처리한다.
+4. Codex fix로 source diff가 바뀌면 기존 테스트·리뷰 evidence를 stale 처리한다.
 5. runner가 전체 테스트를 다시 실행하고 Claude가 close-out 리뷰한다.
 6. 최종 gate 통과 시 READY_FOR_MANUAL_MERGE에서 멈춘다.
-7. 사람이 Orca diff와 GitHub PR을 확인해 직접 push·PR·merge한다.
+7. 사람이 Orca diff를 확인해 직접 commit·push·PR·merge한다.
 8. 머지 뒤 complete --merged-sha <sha>로 DONE을 기록한다.
 
 Claude는 어느 단계에서도 source를 수정하지 않는다. Codex의 “완료” 선언과 모델 간 동의는 증거가 아니다.
@@ -338,7 +338,7 @@ blocker/major에는 입력 또는 조건에서 잘못된 결과로 이어지는 
 |---|---:|
 | 계획 검토 | 2 |
 | checkpoint별 Claude 리뷰 | 2 |
-| checkpoint별 Codex fix | 2 |
+| checkpoint별 Codex fix | 1 |
 | 최종 Claude 리뷰 | 2 |
 | Cursor Repo Scout | run당 1, 정규·재시도 없음 |
 | Cursor 독립 감사 | run당 1, 조건부·재시도 없음 |
@@ -357,8 +357,7 @@ blocker/major에는 입력 또는 조건에서 잘못된 결과로 이어지는 
 - 중단된 Codex 구현·fix는 partial diff를 보존하고 NEEDS_HUMAN으로 간다. blind retry하지 않는다.
 - 이 상태에서는 resolve --continue-partial 또는 resolve --abort만 허용한다. continue-partial은 사람이 현재 diff를 검토·승인한 뒤 runner가 diff hash와 current HEAD를 새 입력 상태로 기록하고 같은 step을 “기존 변경에서 계속”하도록 Codex에 전달한다. 처음부터 재실행하지 않는다.
 - 모델이 직접 commit했거나 HEAD가 예상과 다르면 NEEDS_HUMAN이다.
-- checkpoint commit 직후 중단되면 commit message의 run ID·checkpoint ID와 expected tree가 일치할 때만 adopt한다.
-- 새 source commit이 생기면 이전 head의 테스트·코드 리뷰 evidence는 stale이다.
+- Codex fix로 source diff가 바뀌면 이전 digest의 테스트·코드 리뷰 evidence는 stale이다.
 - worker_done, 자연어 완료 선언, 원본 없는 요약은 gate evidence가 아니다.
 
 테스트 로그 첫머리에는 command ID, command, cwd, exit code, head SHA, 시작·종료 시각을 기록한다.
@@ -423,8 +422,8 @@ v2.0은 Orca orchestration을 사용하지 않는다. Orca는 조작·관찰 화
 1. toy task가 Cursor Scout, 계획 왕복, 계획 승인, Codex 구현, checkpoint Claude 리뷰, Codex fix, 전체 테스트, Claude 최종 리뷰, manual merge 준비까지 완주한다.
 2. PLAN_REVIEW 중 runner를 종료해도 같은 step을 1회 재실행해 이어진다.
 3. Codex 구현 중 runner가 종료되면 partial diff가 보존되고 NEEDS_HUMAN에서 멈춘다.
-4. Codex가 승인 경로 밖 파일을 바꾸면 commit하지 않고 NEEDS_HUMAN으로 간다.
-5. 새 commit 뒤 이전 head의 evidence가 gate에 사용되지 않는다.
+4. Codex가 승인 경로 밖 파일을 바꾸면 NEEDS_HUMAN으로 간다.
+5. source diff가 바뀐 뒤 이전 digest의 evidence가 gate에 사용되지 않는다.
 6. 리뷰·fix 예산을 넘으면 추가 호출 없이 NEEDS_HUMAN으로 간다.
 7. Orca를 완전히 종료했다가 다시 열어 동일 run을 재개한다.
 8. Cursor Scout 결과가 PLAN에서 전부 반영 또는 기각되고 Codex에 동일 원문이 전달된다.

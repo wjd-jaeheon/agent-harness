@@ -2,7 +2,7 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "phase": { "type": "string", "const": "plan" },
+    "phase": { "type": "string", "enum": ["plan", "checkpoint", "final"] },
     "round": { "type": "integer", "minimum": 1 },
     "findings": {
       "type": "array",
@@ -12,7 +12,7 @@
         "properties": {
           "id": { "type": "string", "minLength": 1 },
           "severity": { "type": "string", "enum": ["blocker", "major", "minor"] },
-          "category": { "type": "string", "enum": ["plan_defect", "spec_defect"] },
+          "category": { "type": "string", "enum": ["plan_defect", "code_defect", "spec_defect"] },
           "claim": { "type": "string" },
           "failure_scenario": { "type": "string" },
           "evidence": { "type": "array", "items": { "type": "string" } },

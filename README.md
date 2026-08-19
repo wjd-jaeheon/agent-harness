@@ -1,6 +1,6 @@
-# agent-harness — minimal Phase 2 quick start
+# agent-harness — v2 quick start
 
-현재 구현 범위는 **계획 핑퐁 → Codex 구현 → runner 검증 → 수동 병합 준비**다.
+현재 구현 범위는 **계획 핑퐁 → checkpoint별 Codex 구현·runner 검증·Claude 리뷰 → 최종 교차 검증 → 수동 병합 준비**다.
 
 ```text
 Claude 요구사항 확인
@@ -13,8 +13,11 @@ Cursor Scout 1회
 → 필요하면 Claude 수정
 → Codex 재검토
 → 사람의 계획 승인
-→ Codex 구현
-→ runner diff·보호 경로·CMD 검증
+→ checkpoint별 Codex 구현
+→ runner 범위·보호 경로·CMD 검증
+→ Claude 코드 리뷰
+→ 문제가 있으면 Codex 수정·재검증·Claude 재리뷰
+→ 전체 CMD 실행·Claude 최종 리뷰
 → READY_FOR_MANUAL_MERGE
 ```
 
@@ -47,7 +50,7 @@ Orca에서는 Agent Permissions를 `Manual`로 두고 custom args에 `--dangerou
 /pingpong 다운로드 파일에서 이메일·메신저 말투를 학습하는 기능
 ```
 
-인수 없이 `/pingpong`만 입력하면 `무슨 작업을 계획할까요?`라고 묻는다. 새 작업은 저장소에서 확인할 수 없는 계획 변경 맥락만 한 번에 하나씩 질문하고, 요구사항이 정리되면 목표·제외 범위·완료 기준·검증 명령을 최종 SPEC 요약으로 보여준다. 사용자가 승인해야만 runner의 `init`을 호출한다. `init`은 provider를 부르지 않고 base_sha에서 `CMD-###`만 실행하므로, 그 결과(`specCommandBaseline`, `specAcceptanceCoverage`)를 사람이 보고 SPEC을 고칠지 진행할지 정한 뒤에야 같은 run에 `run`을 호출한다. 이후 Cursor Scout → Claude 계획 → Codex 적대 검토 → 필요시 Claude 수정 → Codex 재검토 후 최종 계획 승인에서 멈춘다.
+인수 없이 `/pingpong`만 입력하면 `무슨 작업을 계획할까요?`라고 묻는다. 새 작업은 저장소에서 확인할 수 없는 계획 변경 맥락만 한 번에 하나씩 질문하고, 요구사항이 정리되면 목표·제외 범위·완료 기준·검증 명령을 최종 SPEC 요약으로 보여준다. 사용자가 승인해야만 runner의 `init`을 호출한다. `init`은 provider를 부르지 않고 base_sha에서 `CMD-###`만 실행하므로, 그 결과(`specCommandBaseline`, `specAcceptanceCoverage`)를 사람이 보고 SPEC을 고칠지 진행할지 정한 뒤에야 같은 run에 `run`을 호출한다. 이후 Cursor Scout → Claude 계획 → Codex 적대 검토 → 필요시 Claude 수정 → Codex 재검토 후 최종 계획 승인에서 멈춘다. 계획 승인 뒤에는 각 checkpoint를 Codex가 구현하고 runner가 검증한 다음 Claude가 읽기 전용 코드 리뷰를 수행한다.
 
 기존 작업은 다음으로 연다.
 
@@ -86,7 +89,7 @@ node .\harness.mjs init `
 
 `init`은 새 worktree를 base_sha로 만든 뒤 SPEC 계약 섹션의 `CMD-###`를 **거기서 한 번 실행한다**. 결과는 `specCommandBaseline`에, `AC-###`별 판정 명령은 `specAcceptanceCoverage`에 담겨 나온다. base에서 통과하는 CMD는 변경 전에도 통과한다는 뜻이므로 이번 작업을 판정하지 못할 수 있다. 자동 거부는 하지 않으니 사람이 보고 판단한다.
 
-검증 명령은 멱등·비파괴여야 한다. runner가 base_sha에서 한 번, 구현 뒤에 또 한 번 실행하기 때문이다. 배포·마이그레이션은 검증이 아니라 작업이다.
+검증 명령은 멱등·비파괴여야 한다. runner가 base_sha, 해당 checkpoint, 수정 뒤 재검증, 최종 검증에서 반복 실행할 수 있기 때문이다. 배포·마이그레이션은 검증이 아니라 작업이다.
 
 출력의 `runId`를 복사한다. 이후 모든 명령은 이 ID를 명시한다.
 
@@ -99,7 +102,7 @@ node .\harness.mjs status --run $run
 `run`은 현재 상태의 자동 단계를 실행하고 다음 중 하나에서 멈춘다.
 
 - `AWAIT_PLAN_APPROVAL`: 계획 검토 가능
-- `READY_FOR_MANUAL_MERGE`: 구현 diff와 필수 검증 통과
+- `READY_FOR_MANUAL_MERGE`: checkpoint·최종 Claude 리뷰와 필수 검증 통과
 - `NEEDS_HUMAN`: 수렴 정지, 예산 소진, 경계 위반, 또는 SPEC 결함. `lastError`와 `lastErrorDetail.next_action` 확인
 
 ## 5. 계획 읽고 결정
@@ -113,6 +116,8 @@ node .\harness.mjs status --run $run
   reviews/
   decisions/
   evidence/
+  checkpoints/
+  final/
   implementation.diff
   implementation-manifest.json
   run.json
@@ -126,7 +131,16 @@ node .\harness.mjs approve-plan --run $run --plan-sha '<currentPlanSha>'
 node .\harness.mjs run --run $run
 ```
 
-승인된 구현은 source를 commit하지 않는다. `READY_FOR_MANUAL_MERGE`에서 `changedPaths`, `implementationDigest`, `verificationEvidence`와 writer worktree diff를 사람이 확인한다.
+승인된 구현은 source를 commit하지 않는다. `READY_FOR_MANUAL_MERGE`에서 `changedPaths`, `implementationDigest`, `verificationEvidence`, `checkpointReviews`, `finalReviewPaths`와 writer worktree diff를 사람이 확인한다.
+
+PLAN의 각 checkpoint는 다음 네 줄을 사용한다. runner는 이 경로 밖의 수정을 거부하고 지정된 CMD만 checkpoint에서 실행한다.
+
+```text
+CP-001: 작업 이름
+Paths: src/app.js, tests/app.test.js
+ACs: AC-001
+Commands: CMD-001
+```
 
 보완이 필요하면 메모 파일을 만든 뒤 한 번 더 핑퐁한다.
 
@@ -166,7 +180,6 @@ node .\harness.mjs run --run $run
 
 ## 현재 한계
 
-- checkpoint별 Claude 코드 리뷰·Codex fix 루프는 아직 없다.
 - verification command는 SPEC `## 계약` 섹션에서 `CMD-001: \`실행할 명령\`` 형식이어야 한다. `## 맥락` 섹션의 언급은 파싱되지 않는다.
 - verification command는 다른 git 저장소를 만들거나 조작하면 안 된다. runner가 구현 산출물을 보여주려고 임시 git 인덱스를 환경변수로 넘기는데 이 환경변수에는 저장소 범위가 없어서, 다른 디렉터리에서 `git init`·`git add`·`git commit`을 하는 명령은 이 저장소의 인덱스를 물려받아 `invalid object ... / error: Error building trees`로 실패한다. base_sha 실행은 통과하고 구현 뒤 검증에서만 실패한다.
 - GitHub 자동 병합은 없다. 최종 병합은 사람이 한다.

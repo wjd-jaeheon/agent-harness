@@ -66,8 +66,8 @@ node "D:/codex-projects/agent-harness/harness.mjs" run --run "<runId>"
 ```
 
 12. runner 결과의 `cursorScoutStatus`가 `unavailable`이면 `cursorScoutUnavailableReason`을 그대로 보여주고 Scout 근거 없이 계획됐다고 명시한다. `AWAIT_PLAN_APPROVAL`이면 반환된 `runId`, `currentPlanPath`, `currentPlanSha`를 사용한다. `currentPlanPath`는 상대 경로이므로 `D:/codex-projects/agent-harness/.harness/runs/<runId>/<currentPlanPath>`에서 최종 PLAN **전문을 끝까지 읽은 뒤**, 한국어 구조화 요약을 반드시 제시하고 전문 파일 경로를 함께 안내한 다음 승인·보완·취소 중 하나를 명시적으로 묻는다. 요약에는 최소한 다음을 포함한다: ① 핵심 설계 결정(번호별), ② 신규·변경 파일 목록, ③ 검증 계획(자동/수동 구분), ④ 미확인 사항과 리스크, ⑤ 리뷰 지적 반영 이력(있는 경우). 요약 없이 승인을 묻지 않는다.
-13. 사용자의 명시적 선택에만 대응하는 기존 `approve-plan`, `request-plan-revision`, `run`, `abort` 명령을 호출한다. exact `runId`와 PLAN SHA를 사용한다. 계획 승인 결과가 `IMPLEMENT_LOOP`이면 같은 run에 `run`을 호출해 Codex 구현과 runner 검증을 진행한다.
-14. `READY_FOR_MANUAL_MERGE`이면 `changedPaths`, `implementationDigest`, `verificationEvidence`, writer worktree 경로를 보여주고 사람이 diff를 검토해 직접 병합하도록 안내한다. `NEEDS_HUMAN`이면 `lastError`와 `lastErrorDetail`을 보여주고 멈춘다. `lastErrorDetail.next_action`이 권장 행동이다. events의 액션이 `spec_gate`이면 계획 수정으로는 못 고치는 SPEC 결함이므로, `lastErrorDetail.blocking_findings[].evidence`가 가리키는 SPEC 줄을 사용자에게 보여주고 SPEC 수정 후 재시작을 묻는다. 실패한 provider를 임의로 우회하거나 새 run을 만들지 않는다.
+13. 사용자의 명시적 선택에만 대응하는 기존 `approve-plan`, `request-plan-revision`, `run`, `abort` 명령을 호출한다. exact `runId`와 PLAN SHA를 사용한다. 계획 승인 결과가 `IMPLEMENT_LOOP`이면 같은 run에 `run`을 호출한다. runner가 checkpoint별 Codex 구현 → CMD 검증 → Claude 코드 리뷰 → 필요시 Codex 수정·재검증을 수행하고, 모든 checkpoint 뒤 전체 CMD와 Claude 최종 리뷰를 수행한다.
+14. `READY_FOR_MANUAL_MERGE`이면 `changedPaths`, `implementationDigest`, `verificationEvidence`, `checkpointReviews`, `finalReviewPaths`, writer worktree 경로를 보여주고 사람이 diff를 검토해 직접 병합하도록 안내한다. `NEEDS_HUMAN`이면 `lastError`와 `lastErrorDetail`을 보여주고 멈춘다. `lastErrorDetail.next_action`이 권장 행동이다. events의 액션이 `spec_gate`이면 계획 수정으로는 못 고치는 SPEC 결함이므로, `lastErrorDetail.blocking_findings[].evidence`가 가리키는 SPEC 줄을 사용자에게 보여주고 SPEC 수정 후 재시작을 묻는다. 실패한 provider를 임의로 우회하거나 새 run을 만들지 않는다.
 15. 사용자가 수정된 최종 SPEC으로 재시작을 명시적으로 승인한 경우에만 기존 run을 `abort`한 뒤 아래처럼 이어받는다. 이전 run이나 SPEC을 자동 선택하지 않는다. 새 run도 `init`이므로 10번의 baseline 확인부터 다시 한다.
 
 ```powershell
