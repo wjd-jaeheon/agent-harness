@@ -38,7 +38,7 @@ orca terminal create --worktree active --title "Pingpong 복구" --command 'node
    - `## 계약` — 사람이 승인하는 부분. 요청, 범위 밖, `AC-###`, `CMD-###`, 제약. runner는 **이 섹션 안에서만** `AC-###`와 `CMD-###`를 파싱한다.
    - `## 맥락` — planner·reviewer·implementer만 읽는다. 대화에서 나온 결정과 근거, 조사한 파일, 버린 대안. 길어도 되고, 이 섹션의 `CMD-###` 언급은 파싱되지 않는다.
    - 각 `AC-###` 줄 끝에 그것을 판정하는 `CMD-###`를 적는다. 자동 판정이 불가능하면 `검증: 수동`이라고 적는다.
-   - **`CMD-###`는 멱등·비파괴여야 한다.** runner가 base_sha에서 한 번, 구현 뒤에 또 한 번 실행한다. 배포·마이그레이션·과금·외부 쓰기는 검증이 아니라 작업이다. 배포 자동화 작업이면 `deploy --dry-run` 같은 형태를 쓴다.
+   - **`CMD-###`는 멱등·비파괴여야 한다.** runner가 base_sha에서 한 번 실행한 뒤, 그 CMD를 지정한 checkpoint마다, Codex 수정 뒤 재검증마다, 그리고 최종 검증에서 반복 실행한다. checkpoint 수와 fix 라운드에 따라 같은 CMD가 여러 번 돌 수 있으므로 실행 시간도 그 기준으로 잡는다. 배포·마이그레이션·과금·외부 쓰기는 검증이 아니라 작업이다. 배포 자동화 작업이면 `deploy --dry-run` 같은 형태를 쓴다.
    - **`CMD-###`는 다른 git 저장소를 만들거나 조작하면 안 된다.** runner가 구현 산출물을 보여주려고 임시 git 인덱스를 환경변수로 넘기는데 이 환경변수에는 저장소 범위가 없다. 다른 디렉터리에서 `git init`·`git add`·`git commit`을 하는 명령은 대상 저장소의 인덱스를 물려받아 `invalid object ... / error: Error building trees`로 실패한다. base_sha 실행은 통과하고 구현 뒤 검증에서만 실패하므로 원인을 찾기 어렵다.
    - 검증 명령은 저장소에서 실제로 쓰는 것을 먼저 찾아 쓴다. 없으면 그 부재 자체를 사용자에게 알리고 무엇으로 판정할지 정한다.
    - `CMD-###`는 정의 줄에서 백틱 하나로 감싼 실행 가능한 명령이어야 하고, 백틱 뒤에 설명을 붙이지 않는다.
@@ -66,8 +66,8 @@ node "D:/codex-projects/agent-harness/harness.mjs" run --run "<runId>"
 ```
 
 12. runner 결과의 `cursorScoutStatus`가 `unavailable`이면 `cursorScoutUnavailableReason`을 그대로 보여주고 Scout 근거 없이 계획됐다고 명시한다. `AWAIT_PLAN_APPROVAL`이면 반환된 `runId`, `currentPlanPath`, `currentPlanSha`를 사용한다. `currentPlanPath`는 상대 경로이므로 `D:/codex-projects/agent-harness/.harness/runs/<runId>/<currentPlanPath>`에서 최종 PLAN **전문을 끝까지 읽은 뒤**, 한국어 구조화 요약을 반드시 제시하고 전문 파일 경로를 함께 안내한 다음 승인·보완·취소 중 하나를 명시적으로 묻는다. 요약에는 최소한 다음을 포함한다: ① 핵심 설계 결정(번호별), ② 신규·변경 파일 목록, ③ 검증 계획(자동/수동 구분), ④ 미확인 사항과 리스크, ⑤ 리뷰 지적 반영 이력(있는 경우). 요약 없이 승인을 묻지 않는다.
-13. 사용자의 명시적 선택에만 대응하는 기존 `approve-plan`, `request-plan-revision`, `run`, `abort` 명령을 호출한다. exact `runId`와 PLAN SHA를 사용한다. 계획 승인 결과가 `IMPLEMENT_LOOP`이면 같은 run에 `run`을 호출해 Codex 구현과 runner 검증을 진행한다.
-14. `READY_FOR_MANUAL_MERGE`이면 `changedPaths`, `implementationDigest`, `verificationEvidence`, writer worktree 경로를 보여주고 사람이 diff를 검토해 직접 병합하도록 안내한다. `NEEDS_HUMAN`이면 `lastError`와 `lastErrorDetail`을 보여주고 멈춘다. `lastErrorDetail.next_action`이 권장 행동이다. events의 액션이 `spec_gate`이면 계획 수정으로는 못 고치는 SPEC 결함이므로, `lastErrorDetail.blocking_findings[].evidence`가 가리키는 SPEC 줄을 사용자에게 보여주고 SPEC 수정 후 재시작을 묻는다. 실패한 provider를 임의로 우회하거나 새 run을 만들지 않는다.
+13. 사용자의 명시적 선택에만 대응하는 기존 `approve-plan`, `request-plan-revision`, `run`, `abort` 명령을 호출한다. exact `runId`와 PLAN SHA를 사용한다. 계획 승인 결과가 `IMPLEMENT_LOOP`이면 같은 run에 `run`을 호출한다. runner가 checkpoint별 Codex 구현 → CMD 검증 → Claude 코드 리뷰 → 필요시 Codex 수정·재검증을 수행하고, 모든 checkpoint 뒤 전체 CMD와 Claude 최종 리뷰를 수행한다.
+14. `READY_FOR_MANUAL_MERGE`이면 `changedPaths`, `implementationDigest`, `verificationEvidence`, `checkpointReviews`, `finalReviewPaths`, writer worktree 경로를 보여주고 사람이 diff를 검토해 직접 병합하도록 안내한다. `NEEDS_HUMAN`이면 `lastError`와 `lastErrorDetail`을 보여주고 멈춘다. `lastErrorDetail.next_action`이 권장 행동이다. events의 액션이 `spec_gate`이면 계획 수정으로는 못 고치는 SPEC 결함이므로, `lastErrorDetail.blocking_findings[].evidence`가 가리키는 SPEC 줄을 사용자에게 보여주고 SPEC 수정 후 재시작을 묻는다. 실패한 provider를 임의로 우회하거나 새 run을 만들지 않는다.
 15. 사용자가 수정된 최종 SPEC으로 재시작을 명시적으로 승인한 경우에만 기존 run을 `abort`한 뒤 아래처럼 이어받는다. 이전 run이나 SPEC을 자동 선택하지 않는다. 새 run도 `init`이므로 10번의 baseline 확인부터 다시 한다.
 
 ```powershell

@@ -14,6 +14,7 @@ function menuFor(state) {
   if (state === 'ABORTED' || state === 'DONE') return [['exit', '종료']];
   if (state === 'PLAN_LOOP') return [['continue', '계속'], ['abort', '중단']];
   if (state === 'IMPLEMENT_LOOP') return [['continue', '구현 실행'], ['abort', '중단']];
+  if (state === 'FINAL_LOOP') return [['continue', '최종 검증 실행'], ['abort', '중단']];
   if (state === 'AWAIT_PLAN_APPROVAL') return [['approve', '계획 승인'], ['revise', '계획 보완 요청'], ['abort', '중단']];
   return [['abort', '중단'], ['exit', '종료']];
 }
