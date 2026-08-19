@@ -11,6 +11,7 @@ import {
   runCommand,
   runProcess,
   sha256Bytes,
+  validatePlan,
 } from '../harness.mjs';
 import { actionArgv, launch } from '../launcher.mjs';
 
@@ -157,6 +158,24 @@ async function initRun(f, providerRunner) {
 async function readRun(harnessRoot, runId) {
   const file = path.join(harnessRoot, '.harness', 'runs', runId, 'run.json');
   return JSON.parse(await readFile(file, 'utf8'));
+}
+
+async function writeRun(harnessRoot, run) {
+  const file = path.join(harnessRoot, '.harness', 'runs', run.run_id, 'run.json');
+  await writeFile(file, `${JSON.stringify(run, null, 2)}\n`, 'utf8');
+}
+
+function implementationStub() {
+  return {
+    changed_paths: [],
+    digest: sha256Bytes(Buffer.from('[]\n')),
+    manifest_path: 'implementation-manifest.json',
+    diff_path: 'implementation.diff',
+    evidence_paths: [],
+    protected_digests: {},
+    checkpoints: [],
+    final_review_paths: [],
+  };
 }
 
 test('init rejects a CMD id that the SPEC mentions but never defines', async (t) => {
@@ -395,6 +414,36 @@ test('launcher exit calls only list', async () => {
   };
   await launch({ cwd: 'D:\\repo', runner, ask: async () => '2', write: () => {} });
   assert.deepEqual(calls, [['list', '--repo', 'D:\\repo']]);
+});
+
+test('launcher offers continue for a FINAL_LOOP run', async () => {
+  const calls = [];
+  const runner = async (argv) => {
+    calls.push(argv);
+    if (argv[0] === 'list') {
+      return {
+        repoPath: 'D:\\repo',
+        runs: [{
+          runId: 'r1',
+          taskSummary: 'Final gate',
+          state: 'FINAL_LOOP',
+          worktreePath: 'D:\\worktrees\\r1',
+        }],
+        warnings: [],
+      };
+    }
+    if (argv[0] === 'status') return { runId: 'r1', state: 'FINAL_LOOP' };
+    return { runId: 'r1', state: 'READY_FOR_MANUAL_MERGE' };
+  };
+  const output = [];
+  await launch({
+    cwd: 'D:\\repo',
+    runner,
+    ask: async () => '1',
+    write: (line) => output.push(line),
+  });
+  assert.ok(output.includes('1. 최종 검증 실행'));
+  assert.deepEqual(calls.at(-1), ['run', '--run', 'r1']);
 });
 
 test('launcher invokes exactly one selected state-changing command after explicit resume', async () => {
@@ -1694,6 +1743,460 @@ test('implementation touching a path outside its checkpoint stops before verific
   assert.equal(verificationCalls, 0);
 });
 
+test('plan checkpoint fields reject directories, empty lists, and duplicates', () => {
+  const run = { spec: { acceptance_ids: ['AC-001'], command_ids: ['CMD-001'] } };
+  const cp = (paths, acs, cmds) =>
+    `# P\n\nAC-001 CMD-001\n\nCP-001: t\nPaths: ${paths}\nACs: ${acs}\nCommands: ${cmds}\n`;
+  assert.match(validatePlan(cp('src/', 'AC-001', 'CMD-001'), run).reason, /not directories/);
+  assert.match(validatePlan(cp(',', 'AC-001', 'CMD-001'), run).reason, /at least one path/);
+  assert.match(validatePlan(cp('app.txt, app.txt', 'AC-001', 'CMD-001'), run).reason, /duplicate paths/);
+  assert.match(validatePlan(cp('app.txt', 'AC-001, AC-001', 'CMD-001'), run).reason, /duplicate ACs/);
+  assert.match(
+    validatePlan(cp('app.txt', 'AC-001', 'CMD-001, CMD-001'), run).reason,
+    /duplicate Commands/,
+  );
+});
+
+test('a directory checkpoint path stops before any Codex spend', async (t) => {
+  const f = await fixture(t);
+  await mkdir(path.join(f.repo, 'subdir'));
+  await writeFile(path.join(f.repo, 'subdir', 'keep.txt'), 'keep\n', 'utf8');
+  await git(f.repo, 'add', '.');
+  await git(f.repo, 'commit', '-m', 'subdir');
+  const plan = `# Plan
+
+AC-001 is implemented in app.txt and verified by CMD-001.
+
+SCOUT-001: incorporated — app.txt is reused.
+
+CP-001: update app
+Paths: app.txt, subdir
+ACs: AC-001
+Commands: CMD-001
+`;
+  const planning = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan } },
+    { step: 'codex_plan_review', result: { review: review(1) } },
+  ]);
+  const created = await initRun(f, planning.providerRunner);
+  const planned = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: planning.providerRunner,
+  });
+  await runCommand(
+    ['approve-plan', '--run', created.runId, '--plan-sha', planned.currentPlanSha],
+    { harnessRoot: f.harnessRoot },
+  );
+  const result = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: async (request) => {
+      throw new Error(`unexpected provider call: ${request.step}`);
+    },
+  });
+
+  assert.equal(result.state, 'NEEDS_HUMAN');
+  assert.match(result.lastError, /CP-001 path is a directory, not a file: subdir/);
+});
+
+test('an AC spanning checkpoints is judged only at its last checkpoint', async (t) => {
+  const f = await fixture(t);
+  const spec = [
+    '# Two checkpoints',
+    '',
+    'AC-001: update app — CMD-001',
+    'AC-002: add new file — CMD-002',
+    '',
+    'CMD-001: `node --check app.txt`',
+    'CMD-002: `node --check new.txt`',
+    '',
+  ].join('\n');
+  await writeFile(f.specPath, spec, 'utf8');
+  const plan = `# Spanning plan
+
+AC-001 maps app.txt to CMD-001.
+AC-002 maps new.txt to CMD-002.
+
+SCOUT-001: incorporated — app.txt is reused.
+
+CP-001: start app work
+Paths: app.txt
+ACs: AC-001
+Commands: CMD-001
+
+CP-002: finish app work and add file
+Paths: app.txt, new.txt
+ACs: AC-001, AC-002
+Commands: CMD-002
+`;
+  const ac2 = {
+    id: 'AC-002',
+    status: 'pass',
+    implementation_ref: 'new.txt',
+    verification_ref: 'CMD-002',
+  };
+  const planning = scriptedProvider([
+    { step: 'cursor_scout', result: { scout } },
+    { step: 'claude_plan', result: { plan } },
+    { step: 'codex_plan_review', result: { review: review(1, { ac: [acPass, ac2], checkpoints: 2 }) } },
+  ]);
+  const created = await initRun(f, planning.providerRunner);
+  const planned = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: planning.providerRunner,
+  });
+  await runCommand(
+    ['approve-plan', '--run', created.runId, '--plan-sha', planned.currentPlanSha],
+    { harnessRoot: f.harnessRoot },
+  );
+  const reviewedIds = [];
+  const result = await runCommand(['run', '--run', created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: async (request) => {
+      if (request.step === 'codex_implement') {
+        const first = request.inputs.checkpoint.id === 'CP-001';
+        await writeFile(
+          path.join(request.cwd, first ? 'app.txt' : 'new.txt'),
+          first ? 'implemented\n' : 'new file\n',
+          'utf8',
+        );
+        return { exitCode: 0, stdout: 'implemented', stderr: '' };
+      }
+      if (request.step === 'claude_code_review') {
+        reviewedIds.push(request.inputs.acceptance_ids);
+        const ac = request.inputs.acceptance_ids.map((id) => (id === 'AC-001' ? acPass : ac2));
+        return {
+          exitCode: 0,
+          stdout: 'reviewed',
+          stderr: '',
+          review: codeReview(request.inputs.phase, request.round, { ac, checkpoints: 2 }),
+        };
+      }
+      throw new Error(`unexpected provider call: ${request.step}`);
+    },
+    processRunner: async () => ({ exitCode: 0, stdout: 'ok\n', stderr: '' }),
+  });
+
+  assert.equal(result.state, 'READY_FOR_MANUAL_MERGE');
+  assert.deepEqual(reviewedIds, [[], ['AC-001', 'AC-002'], ['AC-001', 'AC-002']]);
+});
+
+test('a spec_defect code-review finding stops at spec_gate without a fix round', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    f.specPath,
+    '# Toy SPEC\n\nAC-001: update app\n\nCMD-001: `node --check app.txt`\n',
+    'utf8',
+  );
+  const planning = await runToApproval(f);
+  const before = await readRun(f.harnessRoot, planning.created.runId);
+  await runCommand(
+    ['approve-plan', '--run', planning.created.runId, '--plan-sha', before.current_plan_sha],
+    { harnessRoot: f.harnessRoot, providerRunner: planning.providerRunner },
+  );
+  let reviews = 0;
+  const result = await runCommand(['run', '--run', planning.created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: async (request) => {
+      if (request.step === 'codex_implement') {
+        await writeFile(path.join(request.cwd, 'app.txt'), 'implemented\n', 'utf8');
+        return { exitCode: 0, stdout: 'implemented', stderr: '' };
+      }
+      if (request.step === 'claude_code_review') {
+        reviews += 1;
+        return {
+          exitCode: 0,
+          stdout: 'reviewed',
+          stderr: '',
+          review: codeReview('checkpoint', 1, {
+            findings: [{ ...finding('F-SPEC-001'), category: 'spec_defect' }],
+          }),
+        };
+      }
+      throw new Error(`unexpected provider call: ${request.step}`);
+    },
+    processRunner: async () => ({ exitCode: 0, stdout: 'ok\n', stderr: '' }),
+  });
+
+  assert.equal(result.state, 'NEEDS_HUMAN');
+  assert.equal(reviews, 1);
+  assert.match(result.lastError, /review gate failed/);
+  assert.equal(result.lastErrorDetail.blocking_findings[0].category, 'spec_defect');
+  assert.match(result.lastErrorDetail.next_action, /SPEC/);
+  const events = await readFile(
+    path.join(f.harnessRoot, '.harness', 'runs', planning.created.runId, 'events.jsonl'),
+    'utf8',
+  );
+  assert.match(events, /spec_gate/);
+});
+
+test('a failed checkpoint records its review artifacts and next action', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    f.specPath,
+    '# Toy SPEC\n\nAC-001: update app\n\nCMD-001: `node --check app.txt`\n',
+    'utf8',
+  );
+  const planning = await runToApproval(f);
+  const before = await readRun(f.harnessRoot, planning.created.runId);
+  await runCommand(
+    ['approve-plan', '--run', planning.created.runId, '--plan-sha', before.current_plan_sha],
+    { harnessRoot: f.harnessRoot, providerRunner: planning.providerRunner },
+  );
+  let checkpointReviews = 0;
+  const result = await runCommand(['run', '--run', planning.created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: async (request) => {
+      if (request.step === 'codex_implement') {
+        await writeFile(path.join(request.cwd, 'app.txt'), 'first attempt\n', 'utf8');
+        return { exitCode: 0, stdout: 'implemented', stderr: '' };
+      }
+      if (request.step === 'codex_fix') {
+        await writeFile(path.join(request.cwd, 'app.txt'), 'still wrong\n', 'utf8');
+        return { exitCode: 0, stdout: 'F-CODE-001 rejected', stderr: '' };
+      }
+      if (request.step === 'claude_code_review') {
+        checkpointReviews += 1;
+        return {
+          exitCode: 0,
+          stdout: 'reviewed',
+          stderr: '',
+          review: checkpointReviews === 1
+            ? codeReview('checkpoint', 1, { findings: [finding('F-CODE-001')] })
+            : codeReview('checkpoint', 2, { prior: [{ id: 'F-CODE-001', status: 'open' }] }),
+        };
+      }
+      throw new Error(`unexpected provider call: ${request.step}`);
+    },
+    processRunner: async () => ({ exitCode: 0, stdout: 'ok\n', stderr: '' }),
+  });
+  const run = await readRun(f.harnessRoot, planning.created.runId);
+
+  assert.equal(result.state, 'NEEDS_HUMAN');
+  assert.equal(run.implementation.checkpoints[0].status, 'failed');
+  assert.equal(run.implementation.checkpoints[0].review_paths.length, 2);
+  assert.ok(result.lastErrorDetail.next_action);
+  assert.match(result.lastError, /previous finding F-CODE-001 is not resolved/);
+});
+
+test('a code review that rewrites tracked content is caught by the digest boundary', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    f.specPath,
+    '# Toy SPEC\n\nAC-001: update app\n\nCMD-001: `node --check app.txt`\n',
+    'utf8',
+  );
+  const planning = await runToApproval(f);
+  const before = await readRun(f.harnessRoot, planning.created.runId);
+  await runCommand(
+    ['approve-plan', '--run', planning.created.runId, '--plan-sha', before.current_plan_sha],
+    { harnessRoot: f.harnessRoot, providerRunner: planning.providerRunner },
+  );
+  const result = await runCommand(['run', '--run', planning.created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: async (request) => {
+      if (request.step === 'codex_implement') {
+        await writeFile(path.join(request.cwd, 'app.txt'), 'implemented\n', 'utf8');
+        return { exitCode: 0, stdout: 'implemented', stderr: '' };
+      }
+      if (request.step === 'claude_code_review') {
+        await writeFile(path.join(request.cwd, 'app.txt'), 'tampered by reviewer\n', 'utf8');
+        return {
+          exitCode: 0,
+          stdout: 'reviewed',
+          stderr: '',
+          review: codeReview(request.inputs.phase, request.round),
+        };
+      }
+      throw new Error(`unexpected provider call: ${request.step}`);
+    },
+    processRunner: async () => ({ exitCode: 0, stdout: 'ok\n', stderr: '' }),
+  });
+
+  assert.equal(result.state, 'NEEDS_HUMAN');
+  assert.match(result.lastError, /changed HEAD or worktree status/);
+});
+
+test('a Claude review parse failure surfaces the adapter error', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    f.specPath,
+    '# Toy SPEC\n\nAC-001: update app\n\nCMD-001: `node --check app.txt`\n',
+    'utf8',
+  );
+  const planning = await runToApproval(f);
+  const before = await readRun(f.harnessRoot, planning.created.runId);
+  await runCommand(
+    ['approve-plan', '--run', planning.created.runId, '--plan-sha', before.current_plan_sha],
+    { harnessRoot: f.harnessRoot, providerRunner: planning.providerRunner },
+  );
+  const result = await runCommand(['run', '--run', planning.created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: async (request) => {
+      if (request.step === 'codex_implement') {
+        await writeFile(path.join(request.cwd, 'app.txt'), 'implemented\n', 'utf8');
+        return { exitCode: 0, stdout: 'implemented', stderr: '' };
+      }
+      if (request.step === 'claude_code_review') {
+        return {
+          exitCode: 0,
+          stdout: 'not json',
+          stderr: '',
+          review: null,
+          adapterError: 'Unexpected token n',
+        };
+      }
+      throw new Error(`unexpected provider call: ${request.step}`);
+    },
+    processRunner: async () => ({ exitCode: 0, stdout: 'ok\n', stderr: '' }),
+  });
+
+  assert.equal(result.state, 'NEEDS_HUMAN');
+  assert.match(result.lastError, /Claude code review output is invalid: Unexpected token n/);
+});
+
+test('an interrupted implementation step is reported by its own type', async (t) => {
+  const f = await fixture(t);
+  const planning = await runToApproval(f);
+  const before = await readRun(f.harnessRoot, planning.created.runId);
+  await runCommand(
+    ['approve-plan', '--run', planning.created.runId, '--plan-sha', before.current_plan_sha],
+    { harnessRoot: f.harnessRoot, providerRunner: planning.providerRunner },
+  );
+  const run = await readRun(f.harnessRoot, planning.created.runId);
+  run.active_step = {
+    type: 'claude_code_review',
+    round: 1,
+    input_hash: 'x',
+    pre_head: 'x',
+    pre_status_hash: 'x',
+    attempt: 1,
+    outputs: { stdout: 'reviews/x.raw.json', stderr: 'reviews/x.stderr.log' },
+  };
+  await writeRun(f.harnessRoot, run);
+  const result = await runCommand(['run', '--run', planning.created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: async (request) => {
+      throw new Error(`unexpected provider call: ${request.step}`);
+    },
+  });
+
+  assert.equal(result.state, 'NEEDS_HUMAN');
+  assert.match(result.lastError, /claude_code_review was interrupted/);
+});
+
+test('a resumed FINAL_LOOP re-verifies locked inputs before the final gate', async (t) => {
+  const f = await fixture(t);
+  const planning = await runToApproval(f);
+  const before = await readRun(f.harnessRoot, planning.created.runId);
+  await runCommand(
+    ['approve-plan', '--run', planning.created.runId, '--plan-sha', before.current_plan_sha],
+    { harnessRoot: f.harnessRoot, providerRunner: planning.providerRunner },
+  );
+  const run = await readRun(f.harnessRoot, planning.created.runId);
+  run.state = 'FINAL_LOOP';
+  run.implementation = implementationStub();
+  await writeRun(f.harnessRoot, run);
+  const lockedSpec = path.join(f.harnessRoot, '.harness', 'runs', planning.created.runId, 'SPEC.md');
+  await writeFile(lockedSpec, `${await readFile(lockedSpec, 'utf8')}\ntampered\n`, 'utf8');
+  const result = await runCommand(['run', '--run', planning.created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: async (request) => {
+      throw new Error(`unexpected provider call: ${request.step}`);
+    },
+  });
+
+  assert.equal(result.state, 'NEEDS_HUMAN');
+  assert.match(result.lastError, /SPEC locked digest changed/);
+});
+
+test('a FINAL_LOOP entered twice stops for the human instead of restarting rounds', async (t) => {
+  const f = await fixture(t);
+  const planning = await runToApproval(f);
+  const before = await readRun(f.harnessRoot, planning.created.runId);
+  await runCommand(
+    ['approve-plan', '--run', planning.created.runId, '--plan-sha', before.current_plan_sha],
+    { harnessRoot: f.harnessRoot, providerRunner: planning.providerRunner },
+  );
+  const run = await readRun(f.harnessRoot, planning.created.runId);
+  run.state = 'FINAL_LOOP';
+  run.implementation = { ...implementationStub(), final_started: true };
+  await writeRun(f.harnessRoot, run);
+  const result = await runCommand(['run', '--run', planning.created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: async (request) => {
+      throw new Error(`unexpected provider call: ${request.step}`);
+    },
+  });
+
+  assert.equal(result.state, 'NEEDS_HUMAN');
+  assert.match(result.lastError, /Final verification was interrupted/);
+});
+
+test('an empty implementation cannot enter the final review', async (t) => {
+  const f = await fixture(t);
+  const planning = await runToApproval(f);
+  const before = await readRun(f.harnessRoot, planning.created.runId);
+  await runCommand(
+    ['approve-plan', '--run', planning.created.runId, '--plan-sha', before.current_plan_sha],
+    { harnessRoot: f.harnessRoot, providerRunner: planning.providerRunner },
+  );
+  const run = await readRun(f.harnessRoot, planning.created.runId);
+  run.state = 'FINAL_LOOP';
+  run.implementation = implementationStub();
+  await writeRun(f.harnessRoot, run);
+  const result = await runCommand(['run', '--run', planning.created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: async (request) => {
+      throw new Error(`unexpected provider call: ${request.step}`);
+    },
+  });
+
+  assert.equal(result.state, 'NEEDS_HUMAN');
+  assert.match(result.lastError, /implementation is empty before the final review/);
+});
+
+test('the final review receives every checkpoint review for the cross-check', async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    f.specPath,
+    '# Toy SPEC\n\nAC-001: update app\n\nCMD-001: `node --check app.txt`\n',
+    'utf8',
+  );
+  const planning = await runToApproval(f);
+  const before = await readRun(f.harnessRoot, planning.created.runId);
+  await runCommand(
+    ['approve-plan', '--run', planning.created.runId, '--plan-sha', before.current_plan_sha],
+    { harnessRoot: f.harnessRoot, providerRunner: planning.providerRunner },
+  );
+  let finalInputs = null;
+  const result = await runCommand(['run', '--run', planning.created.runId], {
+    harnessRoot: f.harnessRoot,
+    providerRunner: async (request) => {
+      if (request.step === 'codex_implement') {
+        await writeFile(path.join(request.cwd, 'app.txt'), 'implemented\n', 'utf8');
+        return { exitCode: 0, stdout: 'implemented', stderr: '' };
+      }
+      if (request.step === 'claude_code_review') {
+        if (request.inputs.phase === 'final') finalInputs = request.inputs;
+        return {
+          exitCode: 0,
+          stdout: 'reviewed',
+          stderr: '',
+          review: codeReview(request.inputs.phase, request.round),
+        };
+      }
+      throw new Error(`unexpected provider call: ${request.step}`);
+    },
+    processRunner: async () => ({ exitCode: 0, stdout: 'ok\n', stderr: '' }),
+  });
+
+  assert.equal(result.state, 'READY_FOR_MANUAL_MERGE');
+  assert.equal(finalInputs.checkpoint_reviews.length, 1);
+  assert.equal(finalInputs.checkpoint_reviews[0].id, 'CP-001');
+  assert.equal(finalInputs.checkpoint_reviews[0].reviews[0].phase, 'checkpoint');
+});
+
 test('verification mutating an existing implementation file stops with the changed diff preserved', async (t) => {
   const f = await fixture(t);
   await writeFile(
@@ -2453,17 +2956,28 @@ test('default provider runs Claude code review read-only with structured output'
     assert.ok(calls[0].args.includes(required), required);
   }
   assert.match(calls[0].input, /Claude code reviewer/);
+  const schemaArg = JSON.parse(calls[0].args[calls[0].args.indexOf('--json-schema') + 1]);
+  assert.deepEqual(schemaArg.properties.phase.enum, ['checkpoint', 'final']);
+  assert.deepEqual(
+    schemaArg.properties.findings.items.properties.category.enum,
+    ['code_defect', 'spec_defect'],
+  );
 });
 
 test('default provider reads Codex structured review from output-last-message', async () => {
   const expected = review(1);
   const calls = [];
+  let planSchema;
   const runner = createDefaultProviderRunner({
     harnessRoot: path.resolve('.'),
     env: { ...process.env, OPENAI_API_KEY: '', CODEX_API_KEY: '' },
     commands: { codex: 'codex.exe' },
     processRunner: async (request) => {
       calls.push(request);
+      planSchema = JSON.parse(await readFile(
+        request.args[request.args.indexOf('--output-schema') + 1],
+        'utf8',
+      ));
       const output = request.args[request.args.indexOf('--output-last-message') + 1];
       await writeFile(output, JSON.stringify(expected), 'utf8');
       return { exitCode: 0, stdout: '{"type":"turn.completed"}\n', stderr: '' };
@@ -2496,6 +3010,11 @@ test('default provider reads Codex structured review from output-last-message', 
   }
   assert.equal(calls[0].cwd, 'C:\\repo');
   assert.match(calls[0].input, /"round": 1/);
+  assert.equal(planSchema.properties.phase.const, 'plan');
+  assert.deepEqual(
+    planSchema.properties.findings.items.properties.category.enum,
+    ['plan_defect', 'spec_defect'],
+  );
 });
 
 test('default provider gives Codex implementation and fix workspace-write without review output flags', async () => {

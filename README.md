@@ -142,6 +142,8 @@ ACs: AC-001
 Commands: CMD-001
 ```
 
+`Paths`는 디렉터리나 glob이 아닌 정확한 파일 경로만 허용된다. 한 AC를 여러 checkpoint에 나열하면 마지막으로 나열한 checkpoint에서만 판정한다. checkpoint 리뷰에서 `spec_defect`가 나오면 Codex 수정 없이 `spec_gate`로 멈춘다.
+
 보완이 필요하면 메모 파일을 만든 뒤 한 번 더 핑퐁한다.
 
 ```powershell
